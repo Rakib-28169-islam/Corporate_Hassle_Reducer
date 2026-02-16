@@ -1,9 +1,8 @@
 """
-Agents Module
-AI Workers and Agent Definitions
+Agents Module - Dedicated AI Workers
+Each agent is a specialist connected to its own tools.
 """
 
-# Import AI agents here when ready
-# from .email_agent import EmailAgent
-# from .task_agent import TaskAgent
-# from .report_agent import ReportAgent
+from .gmail_agent import GmailAgent
+from .slack_agent import SlackAgent
+from .outlook_agent import OutlookAgent

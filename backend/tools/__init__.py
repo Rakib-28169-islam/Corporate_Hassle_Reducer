@@ -1,8 +1,9 @@
 """
-Tools Module
-Composio Tools and Integrations
+Tools Module - Composio Integrations
+Each platform has its own dedicated tool file.
 """
 
-# Import Composio tools and custom tools here when ready
-# from composio import Composio
-# from .custom_tools import CustomEmailTool, CustomCalendarTool
+from .gmail_tools import GmailToolManager
+from .slack_tools import SlackToolManager
+from .outlook_tools import OutlookToolManager
+from .app_tools import ToolManager
