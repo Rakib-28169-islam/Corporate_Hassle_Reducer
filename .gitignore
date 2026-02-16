@@ -1,0 +1,48 @@
+# Environment & Secrets (CRITICAL - never commit these)
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual Environment (THIS blocks the 10k+ files)
+**/venv/
+**/env/
+**/.venv/
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS Files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Test
+test/
+tests/__pycache__/
+
+# Node (if React frontend added later)
+node_modules/
+.next/
