@@ -23,8 +23,9 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEST_DB = os.path.join(_backend_dir, "test_phase3.db")
-TEST_CHROMA = os.path.join(_backend_dir, "test_phase3_chroma")
+_test_dir = os.path.dirname(os.path.abspath(__file__))
+TEST_DB = os.path.join(_test_dir, "test_phase3.db")
+TEST_CHROMA = os.path.join(_test_dir, "test_phase3_chroma")
 
 
 async def run_tests():

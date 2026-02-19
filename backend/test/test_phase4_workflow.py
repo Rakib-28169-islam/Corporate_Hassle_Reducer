@@ -205,8 +205,9 @@ async def run_tests():
     from tools.local_tools import LocalToolManager
     from services.sync_service import SyncService
 
-    TEST_DB = os.path.join(_backend_dir, "test_phase4.db")
-    TEST_CHROMA = os.path.join(_backend_dir, "test_phase4_chroma")
+    _test_dir = os.path.dirname(os.path.abspath(__file__))
+    TEST_DB = os.path.join(_test_dir, "test_phase4.db")
+    TEST_CHROMA = os.path.join(_test_dir, "test_phase4_chroma")
 
     # Clean previous test data
     for f in [TEST_DB]:

@@ -154,8 +154,9 @@ async def run_tests():
         from core.sql_generator import SQLGenerator, get_sql_generator
         import core.sql_generator as sg_module
 
-        TEST_DB = os.path.join(_backend_dir, "test_phase5.db")
-        TEST_CHROMA = os.path.join(_backend_dir, "test_phase5_chroma")
+        _test_dir = os.path.dirname(os.path.abspath(__file__))
+        TEST_DB = os.path.join(_test_dir, "test_phase5.db")
+        TEST_CHROMA = os.path.join(_test_dir, "test_phase5_chroma")
 
         # Clean previous
         for f in [TEST_DB]:

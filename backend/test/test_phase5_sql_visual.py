@@ -62,8 +62,9 @@ async def run_visual_test(custom_queries=None):
     from tools.local_tools import LocalToolManager
     from core.sql_generator import SQLGenerator, SQLReviewer
 
-    TEST_DB = os.path.join(_backend_dir, "test_phase5_visual.db")
-    TEST_CHROMA = os.path.join(_backend_dir, "test_phase5_visual_chroma")
+    _test_dir = os.path.dirname(os.path.abspath(__file__))
+    TEST_DB = os.path.join(_test_dir, "test_phase5_visual.db")
+    TEST_CHROMA = os.path.join(_test_dir, "test_phase5_visual_chroma")
 
     # Clean previous
     if os.path.exists(TEST_DB):
