@@ -39,8 +39,9 @@ Desktop.ini
 # Logs
 *.log
 
-# Test
-test/
+# Test artifacts (ChromaDB temp dirs from test runs)
+*_chroma/
+*_chroma_data/
 tests/__pycache__/
 
 # Node (if React frontend added later)

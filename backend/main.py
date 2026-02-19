@@ -1,78 +1,140 @@
-from fastapi import FastAPI, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-import asyncio
+import sys
+import os
 import json
+import logging
+import traceback
+
+sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+from routes.auth import router as auth_router
+from agents.supervisor_agent import SupervisorAgent
+from database import get_database, get_vector_store
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Corporate Hassle Reducer API")
 
-# 1. Allow React to talk to us (CORS)
+# CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # React Default Port
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. The WebSocket Manager (Stores active connections)
+# Include auth routes
+app.include_router(auth_router)
+
+
+# ==================== STARTUP ====================
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database and vector store on server start."""
+    # 1. SQLite — create tables if not exist
+    db = get_database()
+    await db.init_db()
+    logger.info("SQLite database ready")
+
+    # 2. ChromaDB — initialize vector store
+    vs = get_vector_store()
+    logger.info(f"VectorStore ready: {vs.status()}")
+
+# WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections = []
+        self.active_connections: dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, user_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[user_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, user_id: str):
+        self.active_connections.pop(user_id, None)
 
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+    async def send_json(self, user_id: str, data: dict):
+        ws = self.active_connections.get(user_id)
+        if ws:
+            await ws.send_text(json.dumps(data))
 
 manager = ConnectionManager()
 
-# --- ROUTES ---
+# Lazy-loaded supervisor agents per user
+_supervisors: dict[str, SupervisorAgent] = {}
+
+def get_supervisor(user_id: str) -> SupervisorAgent:
+    if user_id not in _supervisors:
+        _supervisors[user_id] = SupervisorAgent(user_id=user_id)
+    return _supervisors[user_id]
+
 
 @app.get("/")
 def read_root():
-    return {"status": "active", "message": "Brain is Online 🧠   hi  rokib + esha" }
+    return {"status": "active", "message": "Corporate Hassle Reducer API"}
+
+
+@app.get("/health")
+async def health_check():
+    """Health check — shows DB tables, vector store status, brain status."""
+    db = get_database()
+    vs = get_vector_store()
+
+    return {
+        "status": "healthy",
+        "database": await db.get_table_info(),
+        "vector_store": vs.status(),
+    }
+
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    """
-    The Real-Time Channel.
-    Frontend connects here to get live email updates.
-    """
-    await manager.connect(websocket)
+    await manager.connect(user_id, websocket)
     try:
-        await manager.send_personal_message(json.dumps({
+        await manager.send_json(user_id, {
             "type": "system",
-            "message": f"Connected! Welcome user {user_id}"
-        }), websocket)
+            "message": f"Connected! Welcome, {user_id}."
+        })
 
-        # --- SIMULATION: BOOTSTRAP SYNC ---
-        # This simulates fetching 100 emails in chunks
-        for i in range(1, 101, 20):
-            await asyncio.sleep(1) # Fake delay
-            await manager.send_personal_message(json.dumps({
-                "type": "progress",
-                "percent": i,
-                "status": f"Fetched {i} emails..."
-            }), websocket)
-
-        await manager.send_personal_message(json.dumps({
-            "type": "complete",
-            "message": "Sync Finished! ✅"
-        }), websocket)
-
-        # Keep connection open for chat
         while True:
             data = await websocket.receive_text()
-            # Echo back (We will hook up the Agent here later)
-            await manager.send_personal_message(f"You said: {data}", websocket)
+            try:
+                payload = json.loads(data)
+                query = payload.get("message", data)
+            except json.JSONDecodeError:
+                query = data
 
+            # Send "thinking" indicator
+            await manager.send_json(user_id, {
+                "type": "thinking",
+                "message": "Processing your request..."
+            })
+
+            # Route through SupervisorAgent (async LangGraph pipeline)
+            try:
+                supervisor = get_supervisor(user_id)
+                result = await supervisor.arun(query)
+
+                # answer_node already formats the WebSocket response
+                await manager.send_json(user_id, result)
+            except Exception as e:
+                logger.error(f"Agent error: {traceback.format_exc()}")
+                await manager.send_json(user_id, {
+                    "type": "error",
+                    "message": f"Agent error: {str(e)}"
+                })
+
+    except WebSocketDisconnect:
+        manager.disconnect(user_id)
+        logger.info(f"User {user_id} disconnected")
     except Exception as e:
-        manager.disconnect(websocket)
-        print(f"User {user_id} disconnected")
+        manager.disconnect(user_id)
+        logger.error(f"WebSocket error for {user_id}: {e}")
+
 
 # To run: uvicorn main:app --reload
