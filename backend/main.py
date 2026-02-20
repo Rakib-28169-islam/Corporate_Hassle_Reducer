@@ -11,8 +11,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from routes.auth import router as auth_router
+from routes.sync import router as sync_router
 from agents.supervisor_agent import SupervisorAgent
 from database import get_database, get_vector_store
+from services.data_fetch_service import get_data_fetch_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,15 +30,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include auth routes
+# Include routes
 app.include_router(auth_router)
+app.include_router(sync_router)
 
 
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database and vector store on server start."""
+    """Initialize database, vector store, and background sync on server start."""
     # 1. SQLite — create tables if not exist
     db = get_database()
     await db.init_db()
@@ -45,6 +48,19 @@ async def startup():
     # 2. ChromaDB — initialize vector store
     vs = get_vector_store()
     logger.info(f"VectorStore ready: {vs.status()}")
+
+    # 3. Start background data sync (checks for new data every 60s)
+    fetch_service = get_data_fetch_service()
+    await fetch_service.start_periodic_sync(interval_seconds=60)
+    logger.info("Background data sync started (60s interval)")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Stop background tasks on server shutdown."""
+    fetch_service = get_data_fetch_service()
+    await fetch_service.stop_periodic_sync()
+    logger.info("Background data sync stopped")
 
 # WebSocket connection manager
 class ConnectionManager:

@@ -287,47 +287,34 @@ async def merge_node(state: WorkflowState) -> dict:
 # =============================================================================
 
 async def handle_general_node(state: WorkflowState) -> dict:
-    """Handle GENERAL/CHAT queries using LLM directly."""
+    """Handle GENERAL/CHAT queries using LLM with automatic fallback."""
     query = state["query"]
     brain_router = get_brain_router()
-    brain = brain_router.get_brain(task_type="general")
 
-    if brain:
-        try:
-            response = brain.invoke(
-                f"You are a corporate assistant. Answer this briefly:\n{query}"
-            )
-            return {
-                "agent_results": [{
-                    "agent": "Supervisor (direct)",
-                    "result": {
-                        "query": query,
-                        "operations": ["CHAT"],
-                        "results": {"CHAT": {"response": response.content}},
-                        "final_answer": response.content,
-                    },
-                }],
-            }
-        except Exception as e:
-            logger.error(f"General handler failed: {e}")
-            return {
-                "agent_results": [{
-                    "agent": "Supervisor (direct)",
-                    "error": str(e),
-                }],
-            }
-
-    return {
-        "agent_results": [{
-            "agent": "Supervisor (direct)",
-            "result": {
-                "query": query,
-                "operations": ["CHAT"],
-                "results": {"CHAT": {"response": "No AI brain available."}},
-                "final_answer": "No AI brain available. Check your API keys.",
-            },
-        }],
-    }
+    try:
+        content = brain_router.invoke_with_fallback(
+            f"You are a corporate assistant. Answer this briefly:\n{query}",
+            task_type="general",
+        )
+        return {
+            "agent_results": [{
+                "agent": "Supervisor (direct)",
+                "result": {
+                    "query": query,
+                    "operations": ["CHAT"],
+                    "results": {"CHAT": {"response": content}},
+                    "final_answer": content,
+                },
+            }],
+        }
+    except Exception as e:
+        logger.error(f"General handler failed (all LLMs): {e}")
+        return {
+            "agent_results": [{
+                "agent": "Supervisor (direct)",
+                "error": str(e),
+            }],
+        }
 
 
 # =============================================================================

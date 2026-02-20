@@ -165,14 +165,12 @@ Category:"""
 
     def _llm_route(self, query):
         """SLOW PATH: Use AI to classify ambiguous queries (~300-500ms)."""
-        brain = self.brain.get_brain(task_type="router")
-        if not brain:
-            logger.error("No brain available for routing")
-            return "GENERAL"
-
         try:
-            response = brain.invoke(self.ROUTING_PROMPT.format(query=query))
-            route = response.content.strip().upper()
+            content = self.brain.invoke_with_fallback(
+                self.ROUTING_PROMPT.format(query=query),
+                task_type="router",
+            )
+            route = content.strip().upper()
 
             for key in self.KEYWORD_RULES:
                 if key in route:
@@ -180,7 +178,7 @@ Category:"""
 
             return "GENERAL"
         except Exception as e:
-            logger.error(f"Routing failed: {e}")
+            logger.error(f"Routing failed (all LLMs): {e}")
             return "GENERAL"
 
     def route_query(self, query):

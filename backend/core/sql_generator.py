@@ -325,14 +325,9 @@ SQL:"""
         """
         prompt = self._build_prompt(query, user_id, tool)
 
-        brain = self.brain.get_brain(task_type="fast")
-        if not brain:
-            logger.error("No LLM brain available for SQL generation")
-            return None
-
         try:
-            response = brain.invoke(prompt)
-            sql = response.content.strip()
+            content = self.brain.invoke_with_fallback(prompt, task_type="fast")
+            sql = content.strip()
 
             # Clean up: remove markdown backticks if LLM wraps the SQL
             if sql.startswith("```"):

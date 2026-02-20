@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from composio_client import Composio
 from dotenv import load_dotenv
+from database import get_database
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ def _get_auth_config_id(tool_name: str) -> str:
     # Fetch auth configs from Composio for this toolkit
     try:
         auth_configs = composio.auth_configs.list(
-            toolkit_slugs=[config["toolkit_slug"]]
+            toolkit_slug=config["toolkit_slug"]
         )
         if auth_configs.items:
             config["auth_config_id"] = auth_configs.items[0].id
@@ -59,16 +60,28 @@ async def connect_tool(tool_name: str, user_id: str = "default"):
     auth_config_id = _get_auth_config_id(tool_name)
 
     try:
-        connection_request = composio.connected_accounts.initiate(
+        connection_request = composio.link.create(
             user_id=user_id,
             auth_config_id=auth_config_id,
             callback_url="http://localhost:5173/auth/callback",
         )
 
+        connection_id = connection_request.connected_account_id
+
+        # Save pending connection to local DB for tracking
+        db = get_database()
+        await db.save_connection(
+            connection_id=connection_id,
+            user_id=user_id,
+            tool=tool_name,
+            composio_id=connection_id,
+            status="pending",
+        )
+
         return {
-            "connection_id": connection_request.id,
+            "connection_id": connection_id,
             "redirect_url": connection_request.redirect_url,
-            "status": connection_request.status,
+            "status": "INITIATED",
         }
     except Exception as e:
         logger.error(f"Failed to initiate connection for {tool_name}: {e}")
@@ -86,9 +99,7 @@ async def get_all_connections_status(user_id: str = "default"):
 
         connections = {}
         for account in accounts.items:
-            toolkit = getattr(account, "toolkit_slug", None) or getattr(
-                getattr(account, "toolkit", None), "slug", "unknown"
-            )
+            toolkit = account.toolkit.slug if account.toolkit else "unknown"
             connections[toolkit] = {
                 "id": account.id,
                 "status": account.status,
@@ -119,10 +130,8 @@ async def get_connection_status(connection_id: str):
     Get status of a single connection (used for polling after OAuth redirect).
     """
     try:
-        account = composio.connected_accounts.get(connection_id)
-        toolkit = getattr(account, "toolkit_slug", None) or getattr(
-            getattr(account, "toolkit", None), "slug", "unknown"
-        )
+        account = composio.connected_accounts.retrieve(connection_id)
+        toolkit = account.toolkit.slug if account.toolkit else "unknown"
         return {
             "id": account.id,
             "status": account.status,

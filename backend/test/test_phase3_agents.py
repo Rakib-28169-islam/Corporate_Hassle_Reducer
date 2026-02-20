@@ -287,6 +287,95 @@ async def run_tests():
           "SEARCH" in full_result["results"]
           and "CALCULATE" in full_result["results"])
 
+    # =================================================================
+    # PHASE 5B — Smart Calculate Pipeline Tests
+    # =================================================================
+    print("\n--- Phase 5B: Smart Calculate Pipeline ---")
+
+    # Re-seed gmail for remaining tests (may have been cleared)
+    await lt.cache_results("test_user", "gmail", "email", gmail_emails)
+
+    # ----- Test 14: _extract_currency finds money in body text -----
+    currency_data = [
+        {"subject": "Invoice", "body": "Total: $500.00 due by Friday"}
+    ]
+    hits = gmail._extract_currency(currency_data)
+    check("_extract_currency finds $500.00 in body",
+          len(hits) == 1 and hits[0]["amount"] == 500.0
+          and hits[0]["source"] == "Invoice")
+
+    # ----- Test 15: _extract_currency ignores bare numbers -----
+    bare_data = [
+        {"subject": "Report 2024",
+         "body": "We have 150 employees in building 4200"}
+    ]
+    hits2 = gmail._extract_currency(bare_data)
+    check("_extract_currency ignores bare numbers (no currency context)",
+          len(hits2) == 0)
+
+    # ----- Test 16: _extract_currency handles multiple currencies -----
+    multi_data = [
+        {"subject": "Expenses",
+         "body": "Hotel $200, Meals €50, Transport 1000 BDT"}
+    ]
+    hits3 = gmail._extract_currency(multi_data)
+    check(f"_extract_currency finds 3 currency amounts (got {len(hits3)})",
+          len(hits3) == 3)
+
+    # ----- Test 17: _is_aggregation_result detects aggregation -----
+    check("_is_aggregation_result: [sender, count] -> True",
+          gmail._is_aggregation_result(
+              [{"sender": "john@co.com", "count": 5}]) is True)
+    check("_is_aggregation_result: [from, subject] -> False",
+          gmail._is_aggregation_result(
+              [{"from": "john@co.com", "subject": "Hi"}]) is False)
+    check("_is_aggregation_result: empty list -> False",
+          gmail._is_aggregation_result([]) is False)
+
+    # ----- Test 18: _do_calculate aggregation passthrough -----
+    agg_context = {
+        "search_results": [
+            {"sender": "j@co", "count": 5},
+            {"sender": "b@co", "count": 3},
+        ],
+        "search_source": "llm_sql",
+    }
+    agg_result = await gmail._do_calculate(
+        "who sends me the most emails", agg_context
+    )
+    check(f"Aggregation passthrough: answer contains 'j@co' and '5' "
+          f"(got: {agg_result['answer']})",
+          "j@co" in agg_result["answer"] and "5" in agg_result["answer"]
+          and agg_result["method"] == "python")
+
+    # ----- Test 19: _do_calculate with currency sum -----
+    currency_context = {
+        "search_results": [
+            {"subject": "Invoice A", "body": "Amount: $500"},
+            {"subject": "Invoice B", "body": "Amount: $250"},
+        ],
+    }
+    currency_result = await gmail._do_calculate(
+        "total amount of invoices", currency_context
+    )
+    check(f"Currency sum: value={currency_result['value']} (expected 750.0)",
+          currency_result["value"] == 750.0
+          and currency_result["method"] == "python")
+
+    # ----- Test 20: _do_calculate count still works -----
+    count_ctx = {"search_results": gmail_emails}
+    count_result = await gmail._do_calculate("how many emails?", count_ctx)
+    check(f"Count still works: {count_result['value']} (expected 5)",
+          count_result["value"] == 5 and count_result["method"] == "python")
+
+    # ----- Test 21: search_source passed through context -----
+    exec_result2 = await gmail.execute("how many emails?",
+                                       operations=["SEARCH", "CALCULATE"])
+    # The search_source should have been set during execute
+    search_src = exec_result2["results"].get("SEARCH", {}).get("source", "")
+    check(f"execute() passes search_source (got: '{search_src}')",
+          search_src in ["sqlite", "chromadb", "hybrid", "composio", "llm_sql"])
+
     # Cleanup
     try:
         if os.path.exists(TEST_DB):

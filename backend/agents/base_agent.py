@@ -185,6 +185,7 @@ class BaseAgent:
                     results["SEARCH"] = await self._do_search(query, context)
                     # Pass search results as context for downstream ops
                     context["search_results"] = results["SEARCH"].get("data", [])
+                    context["search_source"] = results["SEARCH"].get("source", "")
 
                 elif op == "CALCULATE":
                     results["CALCULATE"] = await self._do_calculate(
@@ -319,14 +320,18 @@ class BaseAgent:
         """
         Perform calculations on search results.
 
-        Fallback chain:
-            1. Python len() for "how many" / "count" queries
-            2. Python sum() for "total" / "sum" queries
-            3. LLM for complex calculations (last resort)
+        Priority chain:
+            1. Aggregation passthrough — if SQL returned COUNT/GROUP BY, use it
+            2. "how many" / "count" → len(search_data)
+            3. "total" / "sum" → _extract_currency() first, then _extract_numbers()
+            4. "most" / "least" / "top" → if aggregation, format top row; else len()
+            5. LLM for complex calculations (last resort)
+            6. Fallback
 
         Args:
             query   (str):  The original query (to understand what to calculate)
-            context (dict): Must contain "search_results" from SEARCH step
+            context (dict): Must contain "search_results" from SEARCH step,
+                            may contain "search_source" from SEARCH step
 
         Returns:
             dict with:
@@ -335,9 +340,27 @@ class BaseAgent:
                 method  (str): "python" or "llm"
         """
         search_data = context.get("search_results", [])
+        search_source = context.get("search_source", "")
         query_lower = query.lower()
+        is_agg = (search_source == "llm_sql"
+                  and self._is_aggregation_result(search_data))
 
-        # --- Method 1: Python count (how many, count, number of) ---
+        # --- Priority 1: Aggregation passthrough ---
+        # If SQL already did the math (GROUP BY, COUNT), just format it
+        if is_agg:
+            # Format aggregation rows: "john@co.com: 5, boss@co.com: 3"
+            parts = []
+            for row in search_data:
+                vals = list(row.values())
+                parts.append(": ".join(str(v) for v in vals))
+            answer = ", ".join(parts)
+            return {
+                "answer": answer,
+                "value": search_data,
+                "method": "python",
+            }
+
+        # --- Priority 2: Python count (how many, count, number of) ---
         if any(w in query_lower for w in ["how many", "count", "number of"]):
             count = len(search_data)
             return {
@@ -346,9 +369,18 @@ class BaseAgent:
                 "method": "python",
             }
 
-        # --- Method 2: Python sum (total, sum, add up) ---
+        # --- Priority 3: Python sum (total, sum, add up) ---
         if any(w in query_lower for w in ["total", "sum", "add up"]):
-            # Try to extract numbers from search results
+            # Try currency-aware extraction first
+            currency_hits = self._extract_currency(search_data)
+            if currency_hits:
+                total = sum(h["amount"] for h in currency_hits)
+                return {
+                    "answer": f"{total}",
+                    "value": total,
+                    "method": "python",
+                }
+            # Fallback to generic number extraction
             numbers = self._extract_numbers(search_data)
             if numbers:
                 total = sum(numbers)
@@ -358,7 +390,7 @@ class BaseAgent:
                     "method": "python",
                 }
 
-        # --- Method 3: Python comparison (most, least, top, highest) ---
+        # --- Priority 4: Python comparison (most, least, top, highest) ---
         if any(w in query_lower for w in ["most", "least", "top",
                                            "highest", "lowest"]):
             count = len(search_data)
@@ -368,25 +400,26 @@ class BaseAgent:
                 "method": "python",
             }
 
-        # --- Method 4: LLM for anything else ---
-        brain = self.brain.get_brain(task_type="fast")
-        if brain and search_data:
+        # --- Priority 5: LLM for anything else ---
+        if search_data:
             try:
                 data_summary = json.dumps(search_data[:10], default=str)
-                response = brain.invoke(
+                content = self.brain.invoke_with_fallback(
                     f"Based on this data, answer the calculation question.\n"
                     f"Question: {query}\n"
                     f"Data: {data_summary}\n"
-                    f"Give a short, direct numerical answer."
+                    f"Give a short, direct numerical answer.",
+                    task_type="fast",
                 )
                 return {
-                    "answer": response.content,
-                    "value": response.content,
+                    "answer": content,
+                    "value": content,
                     "method": "llm",
                 }
             except Exception as e:
                 logger.error(f"[{self.tool_name}] LLM calculate failed: {e}")
 
+        # --- Priority 6: Fallback ---
         return {
             "answer": f"Found {len(search_data)} items",
             "value": len(search_data),
@@ -446,16 +479,10 @@ class BaseAgent:
                 content  (str): The generated text
                 model    (str): Which LLM was used
         """
-        brain = self.brain.get_brain(task_type="general")
-        if not brain:
-            return {"content": None, "model": "none",
-                    "error": "No LLM available"}
-
         # Build prompt with context if available
         search_data = context.get("search_results", [])
         context_text = ""
         if search_data:
-            # Include first few search results as context
             context_text = (
                 f"\n\nContext (original content to reference):\n"
                 f"{json.dumps(search_data[:3], default=str)}"
@@ -467,22 +494,12 @@ class BaseAgent:
             f"Write the requested content. Be professional and concise."
         )
 
-        # Try primary brain, fall back to secondary if it fails
-        for task_type in ["general", "fast"]:
-            brain = self.brain.get_brain(task_type=task_type)
-            if not brain:
-                continue
-            try:
-                response = brain.invoke(prompt)
-                return {
-                    "content": response.content,
-                    "model": type(brain).__name__,
-                }
-            except Exception as e:
-                logger.warning(f"[{self.tool_name}] Compose ({task_type}) failed: {e}")
-                continue
-
-        return {"content": None, "model": "none", "error": "All LLMs failed"}
+        try:
+            content = self.brain.invoke_with_fallback(prompt, task_type="general")
+            return {"content": content, "model": "llm"}
+        except Exception as e:
+            logger.error(f"[{self.tool_name}] Compose failed (all LLMs): {e}")
+            return {"content": None, "model": "none", "error": "All LLMs failed"}
 
     # =========================================================================
     # SUMMARIZE — LLM summarizes data
@@ -520,7 +537,6 @@ class BaseAgent:
                 "items_summarized": 0,
             }
 
-        # Try reading brain (Gemini), fall back to fast brain (Groq)
         data_text = json.dumps(search_data[:20], default=str)
         prompt = (
             f"Summarize the following data based on the user's request.\n"
@@ -533,23 +549,17 @@ class BaseAgent:
             f"- If data is insufficient, say so"
         )
 
-        for task_type in ["reading", "fast"]:
-            brain = self.brain.get_brain(task_type=task_type)
-            if not brain:
-                continue
-            try:
-                response = brain.invoke(prompt)
-                return {
-                    "summary": response.content,
-                    "model": type(brain).__name__,
-                    "items_summarized": len(search_data),
-                }
-            except Exception as e:
-                logger.warning(f"[{self.tool_name}] Summarize ({task_type}) failed: {e}")
-                continue
-
-        return {"summary": "All LLMs failed for summarization.",
-                "model": "none", "items_summarized": 0}
+        try:
+            content = self.brain.invoke_with_fallback(prompt, task_type="reading")
+            return {
+                "summary": content,
+                "model": "llm",
+                "items_summarized": len(search_data),
+            }
+        except Exception as e:
+            logger.error(f"[{self.tool_name}] Summarize failed (all LLMs): {e}")
+            return {"summary": "All LLMs failed for summarization.",
+                    "model": "none", "items_summarized": 0}
 
     # =========================================================================
     # CHAT — General conversation
@@ -571,24 +581,20 @@ class BaseAgent:
                 response (str): The chat response
                 model    (str): Which LLM was used
         """
-        brain = self.brain.get_brain(task_type="fast")
-        if not brain:
-            return {"response": "Hello! How can I help you?",
-                    "model": "none"}
-
         try:
-            response = brain.invoke(
+            content = self.brain.invoke_with_fallback(
                 f"You are a helpful corporate assistant. "
                 f"Respond briefly and helpfully.\n\n"
-                f"User: {query}"
+                f"User: {query}",
+                task_type="fast",
             )
             return {
-                "response": response.content,
-                "model": type(brain).__name__,
+                "response": content,
+                "model": "llm",
             }
         except Exception as e:
-            logger.error(f"[{self.tool_name}] Chat failed: {e}")
-            return {"response": f"Sorry, I encountered an error: {e}",
+            logger.error(f"[{self.tool_name}] Chat failed (all LLMs): {e}")
+            return {"response": "Hello! How can I help you?",
                     "model": "none"}
 
     # =========================================================================
@@ -699,6 +705,72 @@ class BaseAgent:
                             except ValueError:
                                 pass
         return numbers
+
+    def _is_aggregation_result(self, data):
+        """
+        Check if search results are SQL aggregation output (GROUP BY/COUNT).
+
+        Normal results have keys like 'from', 'subject', 'body'.
+        Aggregation results have keys like 'count', 'total', 'avg'.
+
+        Args:
+            data (list): Search results list
+
+        Returns:
+            bool: True if data looks like aggregation output
+        """
+        if not data:
+            return False
+        first = data[0]
+        if not isinstance(first, dict):
+            return False
+        agg_keys = {"count", "cnt", "total", "avg", "sum", "min", "max"}
+        return bool(agg_keys & {k.lower() for k in first.keys()})
+
+    def _extract_currency(self, data):
+        """
+        Extract currency amounts from unstructured text in search results.
+
+        Only grabs numbers with currency context (symbol or code nearby).
+        Matches: $50, $1,250.00, €100, £75.50, ৳500, 500 USD, 1000 BDT, 50 TK
+        Ignores: bare numbers like 2024, 12345 (phone), 10001 (zip)
+
+        Args:
+            data (list): List of dicts (search results)
+
+        Returns:
+            list[dict]: Each with 'amount' (float) and 'source' (str), or empty list
+        """
+        PATTERN = (
+            r'(?:[\$\€\£\¥\৳]\s?)'
+            r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)'
+            r'|'
+            r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)'
+            r'\s*(?:USD|EUR|GBP|BDT|TK|INR|JPY)'
+        )
+
+        results = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            for key in ("subject", "body", "text", "snippet"):
+                text = item.get(key, "")
+                if not isinstance(text, str):
+                    continue
+                matches = re.findall(PATTERN, text, re.IGNORECASE)
+                for groups in matches:
+                    val_str = groups[0] or groups[1]
+                    if val_str:
+                        try:
+                            amount = float(val_str.replace(",", ""))
+                            results.append({
+                                "amount": amount,
+                                "source": item.get("subject",
+                                                   item.get("text", ""))[:40],
+                            })
+                        except ValueError:
+                            pass
+        return results
 
     def _build_final_answer(self, query, operations, results):
         """

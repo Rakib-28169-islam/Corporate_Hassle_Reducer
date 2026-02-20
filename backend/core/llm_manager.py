@@ -58,6 +58,36 @@ class BrainRouter:
             return self.groq or self.gemini
         return self.gemini or self.groq
 
+    def _get_fallback_chain(self, task_type="general"):
+        """Returns ordered list of LLMs to try (primary first, then fallback)."""
+        if task_type in ["router", "fast"]:
+            chain = [self.groq, self.gemini]
+        else:
+            chain = [self.gemini, self.groq]
+        return [llm for llm in chain if llm is not None]
+
+    def invoke_with_fallback(self, prompt, task_type="general"):
+        """
+        Try primary LLM, fall back to secondary on failure (e.g. 429 quota).
+
+        Returns the response content string, or raises if all LLMs fail.
+        """
+        chain = self._get_fallback_chain(task_type)
+        if not chain:
+            raise RuntimeError("No AI brains available. Check your API keys.")
+
+        last_error = None
+        for llm in chain:
+            try:
+                response = llm.invoke(prompt)
+                return response.content
+            except Exception as e:
+                model_name = getattr(llm, "model", "unknown")
+                logger.warning(f"LLM {model_name} failed, trying fallback: {e}")
+                last_error = e
+
+        raise last_error
+
     def status(self):
         """Returns which brains are available."""
         return {
