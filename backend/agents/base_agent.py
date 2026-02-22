@@ -1,112 +1,35 @@
-"""
-=============================================================================
-BASE AGENT — Shared Foundation for All Specialist Agents
-=============================================================================
+"""Base agent: shared foundation for Gmail, Slack, Outlook specialist agents.
 
-WHY THIS EXISTS:
-    Before this, every agent (Gmail, Slack, Outlook) had its own code for
-    searching, summarizing, composing — lots of duplicate logic.
-
-    BaseAgent provides the SHARED operations that all agents need:
-        _do_search()    -> SQLite -> ChromaDB -> Composio (smart threshold)
-        _do_calculate() -> Python math first, LLM last resort
-        _do_compose()   -> LLM generates text
-        _do_summarize() -> LLM summarizes data
-        _do_action()    -> OVERRIDE in each agent (gmail sends, slack posts)
-
-    Each specialist agent INHERITS from BaseAgent and only overrides
-    what's unique to its tool (Composio API calls, action methods).
-
-HOW IT WORKS:
-    ┌────────────────────────────────────────────────────┐
-    │  BaseAgent.execute(query, operations)              │
-    │      |                                              │
-    │  For each operation in pipeline order:              │
-    │      |                                              │
-    │  SEARCH    -> _do_search()    -> local first       │
-    │  CALCULATE -> _do_calculate() -> Python math       │
-    │  ACTION    -> _do_action()    -> Composio API      │
-    │  COMPOSE   -> _do_compose()   -> LLM generates     │
-    │  SUMMARIZE -> _do_summarize() -> LLM summarizes    │
-    │  CHAT      -> _do_chat()      -> LLM responds      │
-    │      |                                              │
-    │  Merge all results -> Return                       │
-    └────────────────────────────────────────────────────┘
-
-SEARCH FALLBACK CHAIN (the core of _do_search):
-    1. Check staleness (is cached data too old?)
-    2. SQLite keyword search (3ms, free)
-    3. If results >= 3 (threshold) -> return immediately
-    4. If results < 3 -> ChromaDB semantic search (40ms, free)
-    5. If still < 3 -> Composio API call (1500ms, costly)
-    6. Cache API results in both SQLite + ChromaDB for next time
-
-INHERITANCE:
-    BaseAgent (this file)
-        |
-        |-- GmailAgent   -> overrides _do_action(), _composio_search()
-        |-- SlackAgent   -> overrides _do_action(), _composio_search()
-        |-- OutlookAgent -> overrides _do_action(), _composio_search()
-
-USAGE:
-    # Agents inherit and override:
-    class GmailAgent(BaseAgent):
-        def __init__(self, user_id):
-            super().__init__(user_id, tool_name="gmail")
-
-        def _composio_search(self, query):
-            return self.tools.execute("GMAIL_FETCH_EMAILS", {"query": query})
-
-        def _do_action(self, query, context):
-            # Gmail-specific send/delete/label logic
-            ...
-
-=============================================================================
+Phase 7: Intent-driven search with deterministic execution.
+LLM interprets (via QueryParser). Backend executes strictly.
 """
 
-import os
-import sys
 import re
 import json
 import logging
-import asyncio
-
-# Ensure imports work from any location
-_backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _backend_dir not in sys.path:
-    sys.path.insert(0, _backend_dir)
 
 from core.llm_manager import get_brain_router
 from core.operation_classifier import get_classifier
+from core.query_parser import ParsedIntent
 from tools.local_tools import get_local_tools
 from services.sync_service import get_sync_service
 
 logger = logging.getLogger(__name__)
 
+# Default display fields per tool (for deterministic formatter)
+# These match the canonical field names AFTER normalization
+TOOL_DISPLAY_FIELDS = {
+    "gmail": ["subject", "from", "date"],
+    "slack": ["text", "user", "channel"],
+    "outlook": ["subject", "from", "date", "start", "end"],
+}
+
 
 class BaseAgent:
-    """
-    Base class for all specialist agents (Gmail, Slack, Outlook).
-
-    Provides shared operation handlers that use the cost-first fallback chain.
-    Specialist agents inherit this and override tool-specific methods.
-
-    Key concepts:
-        - execute() runs the full pipeline for a classified query
-        - Each _do_* method handles one operation type
-        - _composio_search() and _do_action() MUST be overridden by child agents
-        - All search/cache logic goes through LocalToolManager (smart threshold)
-    """
+    """Base class for all specialist agents. Provides shared operation handlers
+    with intent-driven search routing. Subclasses override tool-specific methods."""
 
     def __init__(self, user_id="default", tool_name="general"):
-        """
-        Initialize the base agent.
-
-        Args:
-            user_id   (str): The user this agent works for
-            tool_name (str): The tool this agent manages — "gmail", "slack", "outlook"
-                             Used for cache keys, logging, and filtering
-        """
         self.user_id = user_id
         self.tool_name = tool_name
         self.brain = get_brain_router()
@@ -114,386 +37,356 @@ class BaseAgent:
         self.local_tools = get_local_tools()
         self.sync = get_sync_service()
 
-    # =========================================================================
-    # EXECUTE — Main entry point (runs the full pipeline)
-    # =========================================================================
+    # --- Main entry point ---
 
-    async def execute(self, query, operations=None):
-        """
-        Execute a query through the operation pipeline.
-
-        This is the MAIN method that SupervisorAgent calls after routing.
-        It takes the classified operations and runs them in pipeline order.
-
-        How it works:
-            1. If operations not provided, classify the query
-            2. Build the execution pipeline (respecting dependencies)
-            3. Run each operation in step order
-            4. Pass results from earlier steps to later steps (context chaining)
-            5. Return all results merged
-
-        Context chaining:
-            Step 1 (SEARCH) returns data -> passed as context to Step 2 (CALCULATE)
-            This is how "how many emails from John?" works:
-                SEARCH finds 5 emails -> CALCULATE counts them -> "5 emails"
-
-        Args:
-            query      (str):           The user's raw query
-            operations (list, optional): Pre-classified operations.
-                                         If None, classifier runs automatically.
-
-        Returns:
-            dict with:
-                query       (str):  The original query
-                operations  (list): Operations that were executed
-                results     (dict): Per-operation results
-                final_answer (str): The user-facing answer text
-
-        Example:
-            result = await agent.execute("how many unread emails?")
-            # result = {
-            #     "query": "how many unread emails?",
-            #     "operations": ["SEARCH", "CALCULATE"],
-            #     "results": {
-            #         "SEARCH": {"data": [...], "source": "sqlite"},
-            #         "CALCULATE": {"answer": "5 unread emails"},
-            #     },
-            #     "final_answer": "You have 5 unread emails."
-            # }
-        """
-        # Step 1: Classify if not pre-classified
+    async def execute(self, query, operations=None, parsed_intent=None):
+        """Run the classified operation pipeline and return merged results."""
         if operations is None:
             classification = self.classifier.classify(query)
             operations = classification["operations"]
             pipeline = classification["pipeline"]
         else:
-            # Build pipeline from provided operations
             pipeline = self.classifier._build_pipeline(operations)
 
-        logger.info(f"[{self.tool_name}] Executing: {operations} for query: {query[:50]}")
+        intent = self._resolve_intent(parsed_intent)
 
-        # Step 2: Execute each operation in pipeline order
+        logger.info(f"[{self.tool_name}] Executing: {operations} | "
+                    f"intent={intent.intent}/{intent.query_type} "
+                    f"limit={intent.limit} | query: {query[:50]}")
+
         results = {}
-        context = {}  # Shared context passed between steps
+        context = {"parsed_intent": intent}
 
         for step_info in pipeline:
             op = step_info["op"]
-            step_num = step_info["step"]
-
             try:
+                results[op] = await self._dispatch_operation(op, query, context)
                 if op == "SEARCH":
-                    results["SEARCH"] = await self._do_search(query, context)
-                    # Pass search results as context for downstream ops
                     context["search_results"] = results["SEARCH"].get("data", [])
                     context["search_source"] = results["SEARCH"].get("source", "")
-
-                elif op == "CALCULATE":
-                    results["CALCULATE"] = await self._do_calculate(
-                        query, context
-                    )
-
-                elif op == "ACTION":
-                    results["ACTION"] = await self._do_action(query, context)
-
-                elif op == "COMPOSE":
-                    results["COMPOSE"] = await self._do_compose(query, context)
-
-                elif op == "SUMMARIZE":
-                    results["SUMMARIZE"] = await self._do_summarize(
-                        query, context
-                    )
-
-                elif op == "CHAT":
-                    results["CHAT"] = await self._do_chat(query, context)
-
             except Exception as e:
                 logger.error(f"[{self.tool_name}] {op} failed: {e}")
                 results[op] = {"error": str(e)}
 
-        # Step 3: Build final answer
-        final_answer = self._build_final_answer(query, operations, results)
+        # Format search results based on query_type
+        await self._apply_formatting(query, operations, results, context, intent)
 
         return {
             "query": query,
             "operations": operations,
             "results": results,
-            "final_answer": final_answer,
+            "final_answer": self._build_final_answer(query, operations, results),
+            "parsed_intent": intent.to_dict(),
         }
 
-    # =========================================================================
-    # SEARCH — Local-first with smart threshold
-    # =========================================================================
+    def _resolve_intent(self, parsed_intent_dict):
+        """Reconstruct ParsedIntent from dict, or return default."""
+        if parsed_intent_dict and isinstance(parsed_intent_dict, dict):
+            try:
+                return ParsedIntent(
+                    intent=parsed_intent_dict.get("intent", "search"),
+                    limit=parsed_intent_dict.get("limit", 20),
+                    fields=parsed_intent_dict.get("fields", []),
+                    sort=parsed_intent_dict.get("sort", "date_desc"),
+                    filters=parsed_intent_dict.get("filters", {}),
+                    query_type=parsed_intent_dict.get("query_type", "semantic"),
+                    parsed_by=parsed_intent_dict.get("parsed_by", "dict"),
+                )
+            except Exception:
+                pass
+        return ParsedIntent.default()
+
+    async def _apply_formatting(self, query, operations, results, context, intent):
+        """Apply formatting based on query_type:
+        - structured/hybrid: deterministic template (no LLM)
+        - semantic: LLM summarize (for meaning-based presentation)
+        """
+        has_presentation = any(op in results for op in
+                               ("SUMMARIZE", "CHAT", "COMPOSE"))
+        if has_presentation or "SEARCH" not in results:
+            return
+
+        search_data = results["SEARCH"].get("data", [])
+        if not search_data:
+            return
+
+        if intent.query_type in ("structured", "hybrid"):
+            # Deterministic formatting — no LLM, zero hallucination
+            results["FORMATTED"] = self._format_exact_results(search_data, intent)
+        else:
+            # Semantic: use LLM to summarize (with strict count constraint)
+            context["search_results"] = search_data
+            try:
+                results["SUMMARIZE"] = await self._do_summarize(query, context)
+                if "SUMMARIZE" not in operations:
+                    operations.append("SUMMARIZE")
+            except Exception as e:
+                logger.error(f"[{self.tool_name}] Auto-summarize failed: {e}")
+
+    async def _dispatch_operation(self, op, query, context):
+        """Route a single operation to its handler."""
+        handlers = {
+            "SEARCH": self._do_search,
+            "CALCULATE": self._do_calculate,
+            "ACTION": self._do_action,
+            "COMPOSE": self._do_compose,
+            "SUMMARIZE": self._do_summarize,
+            "CHAT": self._do_chat,
+        }
+        handler = handlers.get(op)
+        if handler:
+            return await handler(query, context)
+        return {"error": f"Unknown operation: {op}"}
+
+    # --- SEARCH (intent-driven routing) ---
 
     async def _do_search(self, query, context):
+        """Search using intent-driven routing:
+        - structured → SQLite only (deterministic SQL)
+        - hybrid → ChromaDB IDs → SQLite filter+limit
+        - semantic → full chain (LLM SQL → SQLite → ChromaDB)
         """
-        Search for data using the cost-first fallback chain.
+        intent = context.get("parsed_intent", ParsedIntent.default())
 
-        Fallback chain:
-            1. Check if cached data is stale
-            2. SQLite keyword search (3ms)
-            3. If threshold met (>= 3) -> return
-            4. ChromaDB semantic search (40ms)
-            5. If still not enough -> Composio API (1500ms)
-            6. Cache API results for next time
-
-        Args:
-            query   (str):  The search query
-            context (dict): Shared context from previous steps (unused for SEARCH)
-
-        Returns:
-            dict with:
-                data    (list): The search results (list of content dicts)
-                source  (str):  Where results came from ("sqlite", "chromadb",
-                                "hybrid", "composio", "empty")
-                count   (int):  Number of results
-        """
-        # Step 1: Check staleness
         stale = await self.local_tools.is_stale(
             self.user_id, self.tool_name, max_age_minutes=30
         )
 
-        # Step 2: Search locally (smart threshold)
-        local_result = await self.local_tools.search_local(
-            user_id=self.user_id,
-            tool=self.tool_name,
-            query=query,
-        )
+        # Route to correct search method based on query_type
+        local_result = await self._search_by_type(query, intent)
 
-        local_data = local_result["results"]
-        source = local_result["source"]
+        local_data = local_result.get("results", [])
+        source = local_result.get("source", "")
 
-        # Step 3: If local has data AND not stale -> return
+        # Post-processing guard: ALWAYS enforce limit
+        local_data = local_data[:intent.limit]
+
         if local_data and not stale:
             logger.info(f"[{self.tool_name}] SEARCH: {len(local_data)} results "
-                        f"from {source} (fresh cache)")
-            return {
-                "data": local_data,
-                "source": source,
-                "count": len(local_data),
-            }
+                        f"from {source} (type={intent.query_type})")
+            return self._make_search_result(local_data, source)
 
-        # Step 4: Local empty or stale -> call Composio API
-        logger.info(f"[{self.tool_name}] SEARCH: local {'stale' if stale else 'empty'}, "
-                     f"calling Composio API...")
+        logger.info(f"[{self.tool_name}] SEARCH: local "
+                    f"{'stale' if stale else 'empty'}, calling Composio API...")
 
-        try:
-            api_results = self._composio_search(query)
+        api_result = await self._try_composio_search(query)
+        if api_result:
+            # Post-processing guard on API results too
+            api_data = api_result.get("data", [])[:intent.limit]
+            return self._make_search_result(api_data, "composio")
 
-            if api_results:
-                # Normalize API results to list of dicts
-                items = self._normalize_api_results(api_results)
-
-                if items:
-                    # Cache for next time (both SQLite + ChromaDB)
-                    await self.local_tools.cache_results(
-                        user_id=self.user_id,
-                        tool=self.tool_name,
-                        data_type=self._get_data_type(),
-                        items=items,
-                    )
-
-                    return {
-                        "data": items,
-                        "source": "composio",
-                        "count": len(items),
-                    }
-        except Exception as e:
-            logger.error(f"[{self.tool_name}] Composio API failed: {e}")
-
-        # Step 5: If we had stale local data, return it as fallback
         if local_data:
-            logger.info(f"[{self.tool_name}] API failed, returning stale local data")
-            return {
-                "data": local_data,
-                "source": f"{source}_stale",
-                "count": len(local_data),
-            }
+            logger.info(f"[{self.tool_name}] API failed, returning stale data")
+            return self._make_search_result(local_data, f"{source}_stale")
 
-        # Step 6: Nothing anywhere
         return {"data": [], "source": "empty", "count": 0}
 
-    # =========================================================================
-    # CALCULATE — Python math first, LLM last resort
-    # =========================================================================
+    async def _search_by_type(self, query, intent):
+        """Route search to correct method based on query_type."""
+        if intent.query_type == "structured":
+            return await self.local_tools.search_structured(
+                user_id=self.user_id, tool=self.tool_name, intent=intent,
+            )
+        elif intent.query_type == "hybrid":
+            return await self.local_tools.search_hybrid(
+                user_id=self.user_id, tool=self.tool_name,
+                query=query, intent=intent,
+            )
+        else:
+            # Semantic: use existing full chain
+            return await self.local_tools.search_local(
+                user_id=self.user_id, tool=self.tool_name,
+                query=query, limit=intent.limit,
+            )
+
+    async def _try_composio_search(self, query):
+        """Try Composio API and cache results. Returns search result or None."""
+        try:
+            api_results = self._composio_search(query)
+            if not api_results:
+                return None
+
+            items = self._normalize_api_results(api_results)
+            if not items:
+                return None
+
+            # Normalize Composio field names to canonical names
+            from services.data_fetch_service import get_data_fetch_service
+            items = get_data_fetch_service().normalize_tool_fields(
+                items, self.tool_name
+            )
+
+            await self.local_tools.cache_results(
+                user_id=self.user_id, tool=self.tool_name,
+                data_type=self._get_data_type(), items=items,
+            )
+            return self._make_search_result(items, "composio")
+        except Exception as e:
+            logger.error(f"[{self.tool_name}] Composio API failed: {e}")
+            return None
+
+    def _make_search_result(self, data, source):
+        """Build a standard search result dict."""
+        return {"data": data, "source": source, "count": len(data)}
+
+    # --- Deterministic formatter (no LLM) ---
+
+    def _format_exact_results(self, data, intent):
+        """Format search results deterministically for structured/hybrid queries.
+        Uses only actual data fields — zero hallucination possible.
+        """
+        if not data:
+            return {"formatted": "No results found.", "method": "deterministic"}
+
+        # For count queries, just return the count
+        if intent.intent == "count":
+            if data and isinstance(data[0], dict) and "count" in data[0]:
+                count_val = data[0]["count"]
+            else:
+                count_val = len(data)
+            return {"formatted": f"Count: {count_val}",
+                    "method": "deterministic"}
+
+        # Determine display fields
+        display_fields = (intent.fields if intent.fields
+                          else self._auto_detect_fields(data))
+
+        lines = []
+        for i, item in enumerate(data, 1):
+            if not isinstance(item, dict):
+                lines.append(f"{i}. {str(item)[:200]}")
+                continue
+
+            parts = self._format_item_fields(item, display_fields)
+            if parts:
+                lines.append(f"{i}. {' | '.join(parts)}")
+            else:
+                # Fallback: show first 3 key-value pairs
+                fallback = [f"{k}: {str(v)[:60]}"
+                            for k, v in list(item.items())[:3]]
+                lines.append(f"{i}. {' | '.join(fallback)}")
+
+        header = f"Found {len(data)} result(s):"
+        formatted_text = "\n".join(lines)
+
+        return {
+            "formatted": f"{header}\n{formatted_text}",
+            "method": "deterministic",
+            "fields_shown": display_fields,
+            "count": len(data),
+        }
+
+    def _format_item_fields(self, item, display_fields):
+        """Format a single item using display fields."""
+        parts = []
+        for field in display_fields:
+            value = item.get(field)
+            if value is None:
+                continue
+            label = field.replace("_", " ").title()
+            str_val = str(value)
+            if len(str_val) > 100:
+                str_val = str_val[:97] + "..."
+            parts.append(f"{label}: {str_val}")
+        return parts
+
+    def _auto_detect_fields(self, data):
+        """Auto-detect best display fields based on tool and available data."""
+        default_fields = TOOL_DISPLAY_FIELDS.get(self.tool_name, [])
+        if not data or not isinstance(data[0], dict):
+            return default_fields
+
+        sample = data[0]
+        detected = [f for f in default_fields if f in sample]
+        return detected if detected else list(sample.keys())[:4]
+
+    # --- CALCULATE (multi-strategy) ---
 
     async def _do_calculate(self, query, context):
-        """
-        Perform calculations on search results.
-
-        Priority chain:
-            1. Aggregation passthrough — if SQL returned COUNT/GROUP BY, use it
-            2. "how many" / "count" → len(search_data)
-            3. "total" / "sum" → _extract_currency() first, then _extract_numbers()
-            4. "most" / "least" / "top" → if aggregation, format top row; else len()
-            5. LLM for complex calculations (last resort)
-            6. Fallback
-
-        Args:
-            query   (str):  The original query (to understand what to calculate)
-            context (dict): Must contain "search_results" from SEARCH step,
-                            may contain "search_source" from SEARCH step
-
-        Returns:
-            dict with:
-                answer  (str): The calculation result as text
-                value   (any): The raw numeric value
-                method  (str): "python" or "llm"
-        """
+        """Calculate from search results using the best available strategy."""
         search_data = context.get("search_results", [])
         search_source = context.get("search_source", "")
         query_lower = query.lower()
-        is_agg = (search_source == "llm_sql"
-                  and self._is_aggregation_result(search_data))
 
-        # --- Priority 1: Aggregation passthrough ---
-        # If SQL already did the math (GROUP BY, COUNT), just format it
-        if is_agg:
-            # Format aggregation rows: "john@co.com: 5, boss@co.com: 3"
-            parts = []
-            for row in search_data:
-                vals = list(row.values())
-                parts.append(": ".join(str(v) for v in vals))
-            answer = ", ".join(parts)
-            return {
-                "answer": answer,
-                "value": search_data,
-                "method": "python",
-            }
+        if search_source in ("llm_sql", "structured_sql") \
+                and self._is_aggregation_result(search_data):
+            return self._calc_aggregation(search_data)
 
-        # --- Priority 2: Python count (how many, count, number of) ---
         if any(w in query_lower for w in ["how many", "count", "number of"]):
-            count = len(search_data)
-            return {
-                "answer": f"{count}",
-                "value": count,
-                "method": "python",
-            }
+            return self._calc_simple("python", len(search_data))
 
-        # --- Priority 3: Python sum (total, sum, add up) ---
         if any(w in query_lower for w in ["total", "sum", "add up"]):
-            # Try currency-aware extraction first
-            currency_hits = self._extract_currency(search_data)
-            if currency_hits:
-                total = sum(h["amount"] for h in currency_hits)
-                return {
-                    "answer": f"{total}",
-                    "value": total,
-                    "method": "python",
-                }
-            # Fallback to generic number extraction
-            numbers = self._extract_numbers(search_data)
-            if numbers:
-                total = sum(numbers)
-                return {
-                    "answer": f"{total}",
-                    "value": total,
-                    "method": "python",
-                }
+            return self._calc_sum(search_data)
 
-        # --- Priority 4: Python comparison (most, least, top, highest) ---
-        if any(w in query_lower for w in ["most", "least", "top",
-                                           "highest", "lowest"]):
-            count = len(search_data)
-            return {
-                "answer": f"Found {count} items to compare",
-                "value": count,
-                "method": "python",
-            }
+        if any(w in query_lower for w in
+               ["most", "least", "top", "highest", "lowest"]):
+            return self._calc_simple("python", len(search_data),
+                                     f"Found {len(search_data)} items to compare")
 
-        # --- Priority 5: LLM for anything else ---
         if search_data:
-            try:
-                data_summary = json.dumps(search_data[:10], default=str)
-                content = self.brain.invoke_with_fallback(
-                    f"Based on this data, answer the calculation question.\n"
-                    f"Question: {query}\n"
-                    f"Data: {data_summary}\n"
-                    f"Give a short, direct numerical answer.",
-                    task_type="fast",
-                )
-                return {
-                    "answer": content,
-                    "value": content,
-                    "method": "llm",
-                }
-            except Exception as e:
-                logger.error(f"[{self.tool_name}] LLM calculate failed: {e}")
+            return await self._calc_with_llm(query, search_data)
 
-        # --- Priority 6: Fallback ---
-        return {
-            "answer": f"Found {len(search_data)} items",
-            "value": len(search_data),
-            "method": "fallback",
-        }
+        return self._calc_simple("fallback", len(search_data),
+                                 f"Found {len(search_data)} items")
 
-    # =========================================================================
-    # ACTION — Must be overridden by child agents
-    # =========================================================================
+    def _calc_aggregation(self, data):
+        parts = []
+        for row in data:
+            vals = list(row.values())
+            parts.append(": ".join(str(v) for v in vals))
+        return {"answer": ", ".join(parts), "value": data, "method": "python"}
+
+    def _calc_simple(self, method, value, answer=None):
+        return {"answer": answer or str(value), "value": value, "method": method}
+
+    def _calc_sum(self, search_data):
+        currency_hits = self._extract_currency(search_data)
+        if currency_hits:
+            total = sum(h["amount"] for h in currency_hits)
+            return self._calc_simple("python", total)
+
+        numbers = self._extract_numbers(search_data)
+        if numbers:
+            return self._calc_simple("python", sum(numbers))
+
+        return self._calc_simple("python", 0, "No numeric values found")
+
+    async def _calc_with_llm(self, query, search_data):
+        try:
+            data_summary = json.dumps(search_data[:10], default=str)
+            content = self.brain.invoke_with_fallback(
+                f"Based on this data, answer the calculation question.\n"
+                f"Question: {query}\nData: {data_summary}\n"
+                f"Give a short, direct numerical answer.",
+                task_type="fast",
+            )
+            return {"answer": content, "value": content, "method": "llm"}
+        except Exception as e:
+            logger.error(f"[{self.tool_name}] LLM calculate failed: {e}")
+            return self._calc_simple("fallback", len(search_data),
+                                     f"Found {len(search_data)} items")
+
+    # --- ACTION (override in subclass) ---
 
     async def _do_action(self, query, context):
-        """
-        Perform a mutation (send, delete, move, create, etc.).
-
-        MUST BE OVERRIDDEN by each specialist agent because every tool
-        has different APIs:
-            GmailAgent._do_action() -> uses GMAIL_SEND_EMAIL, etc.
-            SlackAgent._do_action() -> uses SLACK_CHAT_POST_MESSAGE, etc.
-
-        After any action, SyncService is notified to invalidate cache.
-
-        Args:
-            query   (str):  The original query
-            context (dict): Context from previous steps
-
-        Returns:
-            dict with: action (str), status (str), message (str)
-        """
         return {
-            "action": "unknown",
-            "status": "not_implemented",
+            "action": "unknown", "status": "not_implemented",
             "message": f"Action not implemented for {self.tool_name}. "
                        f"Override _do_action() in the specialist agent.",
         }
 
-    # =========================================================================
-    # COMPOSE — LLM generates text
-    # =========================================================================
+    # --- COMPOSE ---
 
     async def _do_compose(self, query, context):
-        """
-        Generate/draft text content using LLM.
-
-        Used for: "draft a reply", "write an email", "compose a message"
-
-        How it works:
-            1. Check if search results exist in context (for reply context)
-            2. Send prompt to LLM with context
-            3. Return generated text
-
-        Args:
-            query   (str):  The original query with compose instructions
-            context (dict): May contain "search_results" for context
-
-        Returns:
-            dict with:
-                content  (str): The generated text
-                model    (str): Which LLM was used
-        """
-        # Build prompt with context if available
         search_data = context.get("search_results", [])
         context_text = ""
         if search_data:
-            context_text = (
-                f"\n\nContext (original content to reference):\n"
-                f"{json.dumps(search_data[:3], default=str)}"
-            )
+            context_text = (f"\n\nContext (original content to reference):\n"
+                            f"{json.dumps(search_data[:3], default=str)}")
 
-        prompt = (
-            f"You are a professional assistant. {query}"
-            f"{context_text}\n\n"
-            f"Write the requested content. Be professional and concise."
-        )
-
+        prompt = (f"You are a professional assistant. {query}"
+                  f"{context_text}\n\nWrite the requested content. "
+                  f"Be professional and concise.")
         try:
             content = self.brain.invoke_with_fallback(prompt, task_type="general")
             return {"content": content, "model": "llm"}
@@ -501,246 +394,120 @@ class BaseAgent:
             logger.error(f"[{self.tool_name}] Compose failed (all LLMs): {e}")
             return {"content": None, "model": "none", "error": "All LLMs failed"}
 
-    # =========================================================================
-    # SUMMARIZE — LLM summarizes data
-    # =========================================================================
+    # --- SUMMARIZE ---
 
     async def _do_summarize(self, query, context):
-        """
-        Summarize search results using LLM.
-
-        Used for: "summarize my emails", "recap slack", "overview of messages"
-
-        How it works:
-            1. Get search results from context (SEARCH must run first)
-            2. Send data to LLM with summarize prompt
-            3. Return summary text
-
-        RAG-aware: The LLM only summarizes data we provide — no hallucination.
-
-        Args:
-            query   (str):  The original query
-            context (dict): Must contain "search_results" from SEARCH step
-
-        Returns:
-            dict with:
-                summary (str): The summary text
-                model   (str): Which LLM was used
-                items_summarized (int): How many items were in the input
-        """
+        """Summarize search results using LLM with strict count constraint."""
         search_data = context.get("search_results", [])
 
         if not search_data:
-            return {
-                "summary": "No data found to summarize.",
-                "model": "none",
-                "items_summarized": 0,
-            }
+            return {"summary": "No data found to summarize.",
+                    "model": "none", "items_summarized": 0}
 
+        count = len(search_data)
         data_text = json.dumps(search_data[:20], default=str)
-        prompt = (
-            f"Summarize the following data based on the user's request.\n"
-            f"User asked: {query}\n\n"
-            f"Data ({len(search_data)} items):\n{data_text}\n\n"
-            f"Rules:\n"
-            f"- ONLY use information from the provided data\n"
-            f"- Be concise (bullet points preferred)\n"
-            f"- Highlight key items, dates, and action items\n"
-            f"- If data is insufficient, say so"
-        )
+        prompt = (f"Summarize the following EXACTLY {count} items based on "
+                  f"the user's request.\n"
+                  f"User asked: {query}\n\n"
+                  f"Data ({count} items):\n{data_text}\n\n"
+                  f"Rules:\n"
+                  f"- ONLY use information from the provided {count} items\n"
+                  f"- Do NOT invent additional items or data\n"
+                  f"- Be concise (bullet points preferred)\n"
+                  f"- Highlight key items, dates, and action items\n"
+                  f"- If data is insufficient, say so")
 
         try:
             content = self.brain.invoke_with_fallback(prompt, task_type="reading")
-            return {
-                "summary": content,
-                "model": "llm",
-                "items_summarized": len(search_data),
-            }
+            return {"summary": content, "model": "llm",
+                    "items_summarized": count}
         except Exception as e:
             logger.error(f"[{self.tool_name}] Summarize failed (all LLMs): {e}")
             return {"summary": "All LLMs failed for summarization.",
                     "model": "none", "items_summarized": 0}
 
-    # =========================================================================
-    # CHAT — General conversation
-    # =========================================================================
+    # --- CHAT ---
 
     async def _do_chat(self, query, context):
-        """
-        Handle general conversation (greetings, help, general questions).
-
-        This doesn't need search results or tool access.
-        Just uses the LLM directly.
-
-        Args:
-            query   (str):  The user's message
-            context (dict): Unused for chat
-
-        Returns:
-            dict with:
-                response (str): The chat response
-                model    (str): Which LLM was used
-        """
         try:
             content = self.brain.invoke_with_fallback(
                 f"You are a helpful corporate assistant. "
-                f"Respond briefly and helpfully.\n\n"
-                f"User: {query}",
+                f"Respond briefly and helpfully.\n\nUser: {query}",
                 task_type="fast",
             )
-            return {
-                "response": content,
-                "model": "llm",
-            }
+            return {"response": content, "model": "llm"}
         except Exception as e:
             logger.error(f"[{self.tool_name}] Chat failed (all LLMs): {e}")
-            return {"response": "Hello! How can I help you?",
-                    "model": "none"}
+            return {"response": "Hello! How can I help you?", "model": "none"}
 
-    # =========================================================================
-    # METHODS TO OVERRIDE IN CHILD AGENTS
-    # =========================================================================
+    # --- Subclass hooks ---
 
     def _composio_search(self, query):
-        """
-        Fetch data from Composio API (tool-specific).
-
-        OVERRIDE THIS in each specialist agent.
-        This is called when local cache is empty or stale.
-
-        Args:
-            query (str): The search query
-
-        Returns:
-            Raw Composio API response (will be normalized by _normalize_api_results)
-
-        Example overrides:
-            GmailAgent:  self.tools.execute("GMAIL_FETCH_EMAILS", {"query": query})
-            SlackAgent:  self.tools.execute("SLACK_SEARCH_MESSAGES", {"query": query})
-            OutlookAgent: self.tools.execute("OUTLOOK_OUTLOOK_LIST_MESSAGES", {...})
-        """
         raise NotImplementedError(
-            f"{self.__class__.__name__} must override _composio_search()"
-        )
+            f"{self.__class__.__name__} must override _composio_search()")
 
     def _get_data_type(self):
-        """
-        Return the data type for this agent's cached items.
-
-        OVERRIDE THIS in each specialist agent.
-
-        Returns:
-            str: "email" for Gmail/Outlook, "message" for Slack, etc.
-        """
         return "data"
 
+    # --- Helpers ---
+
     def _normalize_api_results(self, api_response):
+        """Normalize Composio API response into a list of dicts.
+
+        Handles ToolExecuteResponse objects (which have .data attribute),
+        plain lists, dicts with data/results/messages keys, and raw strings.
         """
-        Normalize raw Composio API response into a list of dicts.
+        if api_response is None:
+            return []
 
-        Composio returns different formats per tool. This method
-        extracts the useful data into a consistent list of dicts.
+        # Handle Composio ToolExecuteResponse objects
+        if hasattr(api_response, "data"):
+            api_response = api_response.data
+        if hasattr(api_response, "response_data"):
+            api_response = api_response.response_data
 
-        Override in child agents if the API response format is unusual.
-
-        Args:
-            api_response: Raw response from Composio API
-
-        Returns:
-            list[dict]: Normalized items, each with at least an "id" field
-        """
         if isinstance(api_response, list):
             return api_response
-
         if isinstance(api_response, dict):
-            # Common Composio patterns
-            if "data" in api_response:
-                data = api_response["data"]
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict):
-                    return [data]
-
-            if "results" in api_response:
-                return api_response["results"]
-
-            if "messages" in api_response:
-                return api_response["messages"]
-
-            # Return as single-item list
+            for key in ("data", "results", "messages", "items", "emails"):
+                if key in api_response:
+                    val = api_response[key]
+                    if isinstance(val, list):
+                        return val
+                    if isinstance(val, dict):
+                        return [val]
+            # Single result dict (has identifiable fields)
+            if any(k in api_response for k in
+                   ("id", "subject", "text", "messageId", "ts")):
+                return [api_response]
             return [api_response]
-
-        # String or other type — wrap it
-        return [{"content": str(api_response)}]
-
-    # =========================================================================
-    # HELPERS
-    # =========================================================================
+        if isinstance(api_response, str):
+            return [{"content": api_response}]
+        return []
 
     def _extract_numbers(self, data):
-        """
-        Extract numeric values from search result data.
-
-        Scans all string values in the data for numbers.
-        Used by _do_calculate() for sum/total operations.
-
-        Args:
-            data (list): List of dicts (search results)
-
-        Returns:
-            list[float]: All numbers found in the data
-        """
         numbers = []
         for item in data:
-            if isinstance(item, dict):
-                for value in item.values():
-                    if isinstance(value, (int, float)):
-                        numbers.append(float(value))
-                    elif isinstance(value, str):
-                        # Extract numbers from strings like "$500" or "100 items"
-                        found = re.findall(r'[\d,]+\.?\d*', value)
-                        for n in found:
-                            try:
-                                numbers.append(float(n.replace(',', '')))
-                            except ValueError:
-                                pass
+            if not isinstance(item, dict):
+                continue
+            for value in item.values():
+                if isinstance(value, (int, float)):
+                    numbers.append(float(value))
+                elif isinstance(value, str):
+                    for n in re.findall(r'[\d,]+\.?\d*', value):
+                        try:
+                            numbers.append(float(n.replace(',', '')))
+                        except ValueError:
+                            pass
         return numbers
 
     def _is_aggregation_result(self, data):
-        """
-        Check if search results are SQL aggregation output (GROUP BY/COUNT).
-
-        Normal results have keys like 'from', 'subject', 'body'.
-        Aggregation results have keys like 'count', 'total', 'avg'.
-
-        Args:
-            data (list): Search results list
-
-        Returns:
-            bool: True if data looks like aggregation output
-        """
-        if not data:
-            return False
-        first = data[0]
-        if not isinstance(first, dict):
+        if not data or not isinstance(data[0], dict):
             return False
         agg_keys = {"count", "cnt", "total", "avg", "sum", "min", "max"}
-        return bool(agg_keys & {k.lower() for k in first.keys()})
+        return bool(agg_keys & {k.lower() for k in data[0].keys()})
 
     def _extract_currency(self, data):
-        """
-        Extract currency amounts from unstructured text in search results.
-
-        Only grabs numbers with currency context (symbol or code nearby).
-        Matches: $50, $1,250.00, €100, £75.50, ৳500, 500 USD, 1000 BDT, 50 TK
-        Ignores: bare numbers like 2024, 12345 (phone), 10001 (zip)
-
-        Args:
-            data (list): List of dicts (search results)
-
-        Returns:
-            list[dict]: Each with 'amount' (float) and 'source' (str), or empty list
-        """
         PATTERN = (
             r'(?:[\$\€\£\¥\৳]\s?)'
             r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)'
@@ -748,7 +515,6 @@ class BaseAgent:
             r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)'
             r'\s*(?:USD|EUR|GBP|BDT|TK|INR|JPY)'
         )
-
         results = []
         for item in data:
             if not isinstance(item, dict):
@@ -757,14 +523,12 @@ class BaseAgent:
                 text = item.get(key, "")
                 if not isinstance(text, str):
                     continue
-                matches = re.findall(PATTERN, text, re.IGNORECASE)
-                for groups in matches:
+                for groups in re.findall(PATTERN, text, re.IGNORECASE):
                     val_str = groups[0] or groups[1]
                     if val_str:
                         try:
-                            amount = float(val_str.replace(",", ""))
                             results.append({
-                                "amount": amount,
+                                "amount": float(val_str.replace(",", "")),
                                 "source": item.get("subject",
                                                    item.get("text", ""))[:40],
                             })
@@ -773,247 +537,50 @@ class BaseAgent:
         return results
 
     def _build_final_answer(self, query, operations, results):
-        """
-        Build a user-facing answer from all operation results.
-
-        Combines results from multiple operations into one coherent response.
-
-        Args:
-            query      (str):  Original query
-            operations (list): Operations that were run
-            results    (dict): Per-operation results
-
-        Returns:
-            str: The final answer text for the user
-        """
+        """Combine per-operation results into one user-facing answer string."""
         parts = []
 
-        if "SEARCH" in results:
-            search = results["SEARCH"]
-            count = search.get("count", 0)
-            source = search.get("source", "unknown")
-            if count > 0:
-                parts.append(f"Found {count} results (from {source}).")
-            else:
-                parts.append("No results found.")
+        # Deterministic formatting takes priority
+        if "FORMATTED" in results:
+            formatted = results["FORMATTED"].get("formatted", "")
+            if formatted:
+                parts.append(formatted)
+        elif "SEARCH" in results:
+            s = results["SEARCH"]
+            count = s.get("count", 0)
+            parts.append(
+                f"Found {count} results (from {s.get('source', 'unknown')})."
+                if count > 0 else "No results found."
+            )
 
         if "CALCULATE" in results:
-            calc = results["CALCULATE"]
-            answer = calc.get("answer", "")
+            answer = results["CALCULATE"].get("answer", "")
             if answer:
                 parts.append(f"Calculation: {answer}")
 
         if "COMPOSE" in results:
-            compose = results["COMPOSE"]
-            content = compose.get("content", "")
+            content = results["COMPOSE"].get("content", "")
             if content:
                 parts.append(f"Draft:\n{content}")
 
         if "SUMMARIZE" in results:
-            summ = results["SUMMARIZE"]
-            summary = summ.get("summary", "")
+            summary = results["SUMMARIZE"].get("summary", "")
             if summary:
-                parts.append(f"Summary:\n{summary}")
+                parts.append(summary)
 
         if "ACTION" in results:
-            action = results["ACTION"]
-            message = action.get("message", "")
-            status = action.get("status", "")
-            parts.append(f"Action: {message} (status: {status})")
+            a = results["ACTION"]
+            parts.append(f"Action: {a.get('message', '')} "
+                         f"(status: {a.get('status', '')})")
 
         if "CHAT" in results:
-            chat = results["CHAT"]
-            response = chat.get("response", "")
+            response = results["CHAT"].get("response", "")
             if response:
                 parts.append(response)
 
         return "\n\n".join(parts) if parts else "I processed your request."
 
-    # =========================================================================
-    # NOTIFY SYNC SERVICE — Called after actions
-    # =========================================================================
-
     async def _notify_action_complete(self, action_type):
-        """
-        Notify SyncService that an action was performed.
-
-        Call this at the END of _do_action() in child agents
-        after any mutation (send, delete, move, etc.).
-
-        Args:
-            action_type (str): What was done — "SEND_EMAIL", "DELETE_MESSAGE", etc.
-        """
         await self.sync.on_action_complete(
             self.user_id, self.tool_name, action_type
         )
-
-
-# =============================================================================
-# TEST BLOCK — Run with: python agents/base_agent.py
-# =============================================================================
-if __name__ == "__main__":
-    import shutil
-
-    sys.stdout.reconfigure(encoding='utf-8')
-
-    TEST_DB = os.path.join(_backend_dir, "test_base_agent.db")
-    TEST_CHROMA = os.path.join(_backend_dir, "test_base_agent_chroma")
-
-    async def run_tests():
-        print("Testing BaseAgent...")
-        print("=" * 60)
-
-        from database.sqlite_manager import DatabaseManager
-        from database.vector_store import VectorStore
-        from tools.local_tools import LocalToolManager
-        from services.sync_service import SyncService
-
-        # Clean previous test files
-        for f in [TEST_DB]:
-            if os.path.exists(f):
-                os.remove(f)
-        try:
-            if os.path.exists(TEST_CHROMA):
-                shutil.rmtree(TEST_CHROMA)
-        except PermissionError:
-            pass
-
-        # Setup test databases
-        db = DatabaseManager(db_path=TEST_DB)
-        await db.init_db()
-        vs = VectorStore(persist_dir=TEST_CHROMA)
-
-        lt = LocalToolManager()
-        lt.db = db
-        lt.vs = vs
-
-        sync_svc = SyncService()
-        sync_svc.local_tools = lt
-
-        # Create a test agent (using BaseAgent directly)
-        agent = BaseAgent(user_id="test_user", tool_name="gmail")
-        agent.local_tools = lt
-        agent.sync = sync_svc
-
-        passed = 0
-        failed = 0
-
-        def check(name, condition):
-            nonlocal passed, failed
-            if condition:
-                passed += 1
-                print(f"  [OK] {name}")
-            else:
-                failed += 1
-                print(f"  [FAIL] {name}")
-
-        # ----- Seed test data -----
-        emails = [
-            {"id": "msg_001", "subject": "Invoice from vendor",
-             "from": "billing@vendor.com", "body": "Total amount: $500"},
-            {"id": "msg_002", "subject": "Team standup notes",
-             "from": "john@company.com", "body": "Discussed deployment plan"},
-            {"id": "msg_003", "subject": "Meeting tomorrow",
-             "from": "boss@company.com", "body": "Let's meet at 3pm"},
-            {"id": "msg_004", "subject": "Quarterly report",
-             "from": "hr@company.com", "body": "Revenue: $10000"},
-            {"id": "msg_005", "subject": "Slack integration update",
-             "from": "dev@company.com", "body": "Bot is ready for testing"},
-        ]
-        await lt.cache_results("test_user", "gmail", "email", emails)
-
-        # ----- Test 1: Operation classification -----
-        classification = agent.classifier.classify("how many unread emails?")
-        check("Classifier detects SEARCH+CALCULATE",
-              set(classification["operations"]) == {"SEARCH", "CALCULATE"})
-
-        # ----- Test 2: _do_search (local cache hit) -----
-        search_result = await agent._do_search("invoice", {})
-        check(f"Search finds results: count={search_result['count']}",
-              search_result["count"] > 0)
-        check("Search source is local (not composio)",
-              search_result["source"] in ["sqlite", "chromadb", "hybrid"])
-
-        # ----- Test 3: _do_search (all data, threshold met) -----
-        search_all = await agent._do_search("email", {})
-        check(f"Search all: count={search_all['count']} (should be >= 3)",
-              search_all["count"] >= 3)
-
-        # ----- Test 4: _do_calculate (count) -----
-        context = {"search_results": emails}
-        calc_result = await agent._do_calculate("how many emails?", context)
-        check(f"Calculate count: {calc_result['answer']} (expected 5)",
-              calc_result["value"] == 5)
-        check("Calculate used Python (not LLM)",
-              calc_result["method"] == "python")
-
-        # ----- Test 5: _do_calculate (sum) -----
-        calc_sum = await agent._do_calculate("total amount", context)
-        check(f"Calculate sum found numbers",
-              calc_sum["method"] == "python" and calc_sum["value"] > 0)
-
-        # ----- Test 6: _extract_numbers -----
-        numbers = agent._extract_numbers(emails)
-        check(f"Extract numbers: {numbers}",
-              500.0 in numbers and 10000.0 in numbers)
-
-        # ----- Test 7: _do_action (base returns not_implemented) -----
-        action_result = await agent._do_action("send email", {})
-        check("Base _do_action returns not_implemented",
-              action_result["status"] == "not_implemented")
-
-        # ----- Test 8: _do_chat -----
-        chat_result = await agent._do_chat("hello", {})
-        check("Chat returns a response",
-              chat_result.get("response") is not None)
-
-        # ----- Test 9: Full execute pipeline -----
-        exec_result = await agent.execute("how many emails?",
-                                          operations=["SEARCH", "CALCULATE"])
-        check("Execute returns all expected keys",
-              all(k in exec_result for k in
-                  ["query", "operations", "results", "final_answer"]))
-        check("Execute has SEARCH result",
-              "SEARCH" in exec_result["results"])
-        check("Execute has CALCULATE result",
-              "CALCULATE" in exec_result["results"])
-
-        # ----- Test 10: _normalize_api_results -----
-        check("Normalize list -> list",
-              agent._normalize_api_results([{"a": 1}]) == [{"a": 1}])
-        check("Normalize dict with data -> list",
-              agent._normalize_api_results({"data": [{"a": 1}]}) == [{"a": 1}])
-        check("Normalize string -> wrapped list",
-              agent._normalize_api_results("hello") == [{"content": "hello"}])
-
-        # ----- Test 11: _build_final_answer -----
-        answer = agent._build_final_answer(
-            "test", ["SEARCH", "CALCULATE"],
-            {
-                "SEARCH": {"count": 5, "source": "sqlite"},
-                "CALCULATE": {"answer": "5"},
-            }
-        )
-        check("Final answer includes search count",
-              "5 results" in answer)
-        check("Final answer includes calculation",
-              "5" in answer)
-
-        # ----- Cleanup -----
-        try:
-            if os.path.exists(TEST_DB):
-                os.remove(TEST_DB)
-        except PermissionError:
-            pass
-        try:
-            if os.path.exists(TEST_CHROMA):
-                shutil.rmtree(TEST_CHROMA)
-        except PermissionError:
-            print("  [INFO] Could not delete test ChromaDB (locked, OK on Windows)")
-
-        print()
-        print("=" * 60)
-        print(f"[RESULTS] {passed} passed, {failed} failed "
-              f"out of {passed + failed} tests")
-
-    asyncio.run(run_tests())

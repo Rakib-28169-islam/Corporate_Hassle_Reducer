@@ -1,144 +1,264 @@
-"""
-=============================================================================
-WORKFLOW GRAPH — LangGraph StateGraph for query processing
-=============================================================================
+"""LangGraph StateGraph for query processing — routes queries to agents.
 
-Replaces the ad-hoc supervisor dispatch with a proper async graph:
-
-Single-agent (90%):
-  START -> classify -> route -> execute_agent -> answer -> END
-
-Multi-agent (10%):
-  START -> classify -> route -> [execute_gmail + execute_slack + ...] -> merge -> answer -> END
-
-General/Chat:
-  START -> classify -> route -> handle_general -> answer -> END
-
-KEY DESIGN DECISIONS:
-  - Graph is a singleton; agents are created per-invocation (they hold user state)
-  - Each platform = separate node (LangGraph needs named nodes for parallel)
-  - Multi-agent requires conjunction ("and", "both") to prevent false positives
-  - answer_node produces exact WebSocket format so main.py just sends it
-=============================================================================
+Phase 8: Single understand_node replaces classify + parse_intent + route.
+Flow: understand → [execute_*] → answer
 """
 
 import re
 import logging
+from datetime import datetime, timezone
 
 from langgraph.graph import StateGraph, END
 
 from core.workflow_state import WorkflowState
 from core.operation_classifier import get_classifier
-from core.routing import get_router
 from core.llm_manager import get_brain_router
+from core.query_parser import (
+    ParsedIntent, UnifiedUnderstanding, Platform, OperationType,
+    UNDERSTAND_PROMPT, post_validate,
+)
 
 logger = logging.getLogger(__name__)
 
-# Platform agents — imported lazily inside nodes to avoid circular imports
-# and because agents hold per-user state (created fresh per invocation).
-
 AGENT_PLATFORMS = {"GMAIL", "SLACK", "OUTLOOK"}
 
-# Conjunction patterns that signal multi-agent intent
 _MULTI_AGENT_PATTERN = re.compile(
     r"\b(and|both|as well as|also|plus)\b", re.IGNORECASE
 )
 
+PLATFORM_KEYWORDS = {
+    "GMAIL": ["gmail", "g-mail", "google mail", "email", "mail", "inbox"],
+    "SLACK": ["slack", "channel", "message"],
+    "OUTLOOK": ["outlook", "calendar", "meeting", "schedule", "event"],
+}
 
-# =============================================================================
-# HELPER: Detect multi-agent queries
-# =============================================================================
+# General/greeting keywords — queries matching ONLY these go to GENERAL
+_GENERAL_KEYWORDS = [
+    "hello", "hi", "hey", "howdy", "sup", "yo",
+    "good morning", "good afternoon", "good evening",
+    "thanks", "thank you", "bye", "goodbye",
+    "who are you", "what are you", "what can you do",
+    "whats your agenda", "your agenda",
+    "how does this work", "help me", "help",
+]
+
 
 def _detect_multi_agent(query: str) -> list[str]:
-    """
-    Detect if a query targets multiple platforms.
-
-    Rules:
-      1. Must contain a conjunction word ("and", "both", "also", ...)
-      2. Must mention 2+ platform keywords
-      3. Returns list of matched platforms, or empty list
-
-    Examples:
-      "check gmail and slack" -> ["GMAIL", "SLACK"]
-      "check my emails"       -> []  (single platform, no conjunction)
-      "gmail slack outlook"   -> []  (no conjunction, ambiguous)
-    """
+    """Return list of matched platforms if query targets 2+, else empty list."""
     if not _MULTI_AGENT_PATTERN.search(query):
         return []
 
     query_lower = query.lower()
-    matched = []
-
-    # Check for platform mentions
-    platform_keywords = {
-        "GMAIL": ["gmail", "g-mail", "google mail", "email", "mail", "inbox"],
-        "SLACK": ["slack", "channel", "message"],
-        "OUTLOOK": ["outlook", "calendar", "meeting", "schedule", "event"],
-    }
-
-    for platform, keywords in platform_keywords.items():
-        if any(kw in query_lower for kw in keywords):
-            matched.append(platform)
-
+    matched = [
+        platform for platform, keywords in PLATFORM_KEYWORDS.items()
+        if any(kw in query_lower for kw in keywords)
+    ]
     return matched if len(matched) >= 2 else []
 
 
-# =============================================================================
-# NODE 1: classify_node
-# =============================================================================
+# --- Keyword fast-path helpers ---
 
-async def classify_node(state: WorkflowState) -> dict:
+def _keyword_detect_platform(query_lower: str):
+    """Detect platform from keywords. Returns platform string or None."""
+    matched = []
+    for platform, keywords in PLATFORM_KEYWORDS.items():
+        if any(kw in query_lower for kw in keywords):
+            matched.append(platform)
+
+    if len(matched) == 1:
+        return matched[0]
+
+    # Check for pure general/greeting
+    if len(matched) == 0:
+        for kw in _GENERAL_KEYWORDS:
+            if kw in query_lower:
+                return "GENERAL"
+
+    return None  # Ambiguous or no match
+
+
+def _is_simple_query(query_lower: str) -> bool:
+    """Check if query is simple enough for keyword-only understanding.
+
+    Returns False (needs LLM) when the query contains:
+    - Topic/concept markers that need semantic understanding
+    - Person/sender references that need filter extraction
+    - Field specifications that need field extraction
+    - Date references that need resolution
     """
-    Runs OperationClassifier + multi-agent detection.
+    llm_markers = [
+        # Topic/concept
+        "about", "related to", "regarding", "concerning",
+        "describe", "explain", "summarize",
+        # Person/sender (space-padded to reduce false matches)
+        " from ", " of ", " by ", " sent by ", " to ",
+        # Field specifications
+        " with ",
+        # Date references needing resolution
+        "yesterday", "last week", "this week", "last month",
+        "today", "tomorrow",
+    ]
+    return not any(marker in f" {query_lower} " for marker in llm_markers)
 
-    Sets: operations, pipeline, is_multi_agent, target_agents
+
+def _extract_limit_from_query(query_lower: str):
+    """Extract numeric limit from simple patterns like 'last 10', 'top 5'."""
+    m = re.search(r'\b(?:last|top|recent|first|latest)\s+(\d+)\b', query_lower)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _try_keyword_fast_path(query: str):
+    """Attempt full understanding from keywords alone.
+    Returns (UnifiedUnderstanding, ParsedIntent) tuple if confident, else (None, None).
+    """
+    query_lower = query.lower().strip()
+    for ch in "?!.,;:'\"()[]{}":
+        query_lower = query_lower.replace(ch, "")
+
+    # Detect platform
+    platform = _keyword_detect_platform(query_lower)
+    if platform is None:
+        return None, None
+
+    # Detect operations via existing classifier
+    classification = get_classifier().classify(query)
+    ops = classification["operations"]
+
+    # If classifier fell back to default and it's not obviously chat, need LLM
+    if ops == ["CHAT"] and classification["classified_by"] == "default":
+        if platform != "GENERAL":
+            return None, None  # Ambiguous ops for a platform query
+
+    # Complex queries need LLM for keyword/topic extraction
+    if not _is_simple_query(query_lower):
+        return None, None
+
+    # Extract simple params
+    limit = _extract_limit_from_query(query_lower)
+
+    # Determine intent
+    intent_type = "search"
+    if "CALCULATE" in ops and any(w in query_lower
+                                   for w in ["how many", "count", "number of"]):
+        intent_type = "count"
+
+    # Build filters from obvious keywords
+    filters = {}
+    if "unread" in query_lower:
+        filters["unread"] = True
+
+    understanding = UnifiedUnderstanding(
+        platform=Platform(platform),
+        operations=[OperationType(op) for op in ops],
+        intent=intent_type,
+        limit=limit,
+        fields=[],
+        sort="date_desc",
+        filters=filters,
+    )
+
+    intent = post_validate(understanding, query)
+    return understanding, intent
+
+
+# --- LLM structured output ---
+
+async def _llm_understand(query: str):
+    """Call LLM with structured output for unified query understanding.
+    Returns (UnifiedUnderstanding, ParsedIntent) tuple.
+    On failure returns safe defaults.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prompt = UNDERSTAND_PROMPT.format(query=query, today=today)
+
+    try:
+        import asyncio
+        understanding = await asyncio.to_thread(
+            get_brain_router().invoke_structured,
+            prompt, UnifiedUnderstanding, "fast", 15,
+        )
+        intent = post_validate(understanding, query)
+        return understanding, intent
+    except Exception as e:
+        logger.error(f"[understand] LLM structured output failed: {e}")
+        # Safe fallback
+        understanding = UnifiedUnderstanding(
+            platform=Platform.GENERAL,
+            operations=[OperationType.CHAT],
+        )
+        return understanding, ParsedIntent.default()
+
+
+# --- Graph nodes ---
+
+async def understand_node(state: WorkflowState) -> dict:
+    """Unified understanding: keyword fast-path OR LLM structured output.
+
+    Replaces: classify_node + parse_intent_node + route_node.
+    Returns: route, operations, pipeline, parsed_intent, is_multi_agent, target_agents.
     """
     query = state["query"]
-    classifier = get_classifier()
-    classification = classifier.classify(query)
 
-    # Detect multi-agent
+    # Step 1: Multi-agent detection (cheap regex)
     targets = _detect_multi_agent(query)
+    if len(targets) >= 2:
+        understanding, intent = _try_keyword_fast_path(query)
+        if understanding is None:
+            understanding, intent = await _llm_understand(query)
 
+        ops_str = [op.value for op in understanding.operations]
+        logger.info(f"[understand] MULTI | ops={ops_str} | "
+                    f"targets={targets}")
+        return {
+            "route": "MULTI",
+            "routed_by": "multi_detect",
+            "operations": ops_str,
+            "pipeline": get_classifier()._build_pipeline(ops_str),
+            "is_multi_agent": True,
+            "target_agents": targets,
+            "parsed_intent": intent.to_dict(),
+        }
+
+    # Step 2: Keyword fast-path (for obvious queries)
+    understanding, intent = _try_keyword_fast_path(query)
+    if understanding is not None:
+        ops_str = [op.value for op in understanding.operations]
+        logger.info(
+            f"[understand] FAST-PATH | route={understanding.platform.value} | "
+            f"ops={ops_str} | intent={intent.intent}/{intent.query_type} | "
+            f"limit={intent.limit}")
+        return {
+            "route": understanding.platform.value,
+            "routed_by": "keyword_fast_path",
+            "operations": ops_str,
+            "pipeline": get_classifier()._build_pipeline(ops_str),
+            "is_multi_agent": False,
+            "target_agents": [],
+            "parsed_intent": intent.to_dict(),
+        }
+
+    # Step 3: LLM structured output (one call, schema-validated)
+    understanding, intent = await _llm_understand(query)
+    ops_str = [op.value for op in understanding.operations]
+    logger.info(
+        f"[understand] LLM | route={understanding.platform.value} | "
+        f"ops={ops_str} | intent={intent.intent}/{intent.query_type} | "
+        f"limit={intent.limit} | filters={intent.filters}")
     return {
-        "operations": classification["operations"],
-        "pipeline": classification["pipeline"],
-        "is_multi_agent": len(targets) >= 2,
-        "target_agents": targets,
+        "route": understanding.platform.value,
+        "routed_by": "llm_structured",
+        "operations": ops_str,
+        "pipeline": get_classifier()._build_pipeline(ops_str),
+        "is_multi_agent": False,
+        "target_agents": [],
+        "parsed_intent": intent.to_dict(),
     }
 
 
-# =============================================================================
-# NODE 2: route_node
-# =============================================================================
-
-async def route_node(state: WorkflowState) -> dict:
-    """
-    Runs QueryRouter (keyword -> LLM fallback).
-
-    For multi-agent queries, route is set to "MULTI" (routing already
-    determined by classify_node's target_agents).
-
-    Sets: route, routed_by
-    """
-    if state.get("is_multi_agent"):
-        return {"route": "MULTI", "routed_by": "multi_detect"}
-
-    router = get_router()
-    route, routed_by = router.route_query(state["query"])
-    return {"route": route, "routed_by": routed_by}
-
-
-# =============================================================================
-# NODE 3: execute_single_agent_node
-# =============================================================================
-
 async def execute_single_agent_node(state: WorkflowState) -> dict:
-    """
-    Calls the appropriate agent's execute() for single-agent queries.
-
-    Creates a fresh agent instance per invocation (agents hold per-user state).
-    """
+    """Execute the appropriate agent for single-platform queries."""
     from agents.gmail_agent import GmailAgent
     from agents.slack_agent import SlackAgent
     from agents.outlook_agent import OutlookAgent
@@ -147,6 +267,7 @@ async def execute_single_agent_node(state: WorkflowState) -> dict:
     user_id = state.get("user_id", "default")
     query = state["query"]
     operations = state.get("operations")
+    parsed_intent = state.get("parsed_intent")
 
     agent_map = {
         "GMAIL": ("GmailAgent", lambda: GmailAgent(user_id=user_id)),
@@ -156,143 +277,56 @@ async def execute_single_agent_node(state: WorkflowState) -> dict:
 
     entry = agent_map.get(route)
     if not entry:
-        return {
-            "agent_results": [{
-                "agent": route,
-                "error": f"Unknown route: {route}",
-            }],
-        }
+        return {"agent_results": [{"agent": route, "error": f"Unknown route: {route}"}]}
 
     agent_name, factory = entry
     try:
-        agent = factory()
-        result = await agent.execute(query, operations=operations)
-        return {
-            "agent_results": [{
-                "agent": agent_name,
-                "result": result,
-            }],
-        }
+        result = await factory().execute(
+            query, operations=operations, parsed_intent=parsed_intent,
+        )
+        return {"agent_results": [{"agent": agent_name, "result": result}]}
     except Exception as e:
         logger.error(f"[{route}] Agent execution failed: {e}")
-        return {
-            "agent_results": [{
-                "agent": agent_name,
-                "error": str(e),
-            }],
-        }
+        return {"agent_results": [{"agent": agent_name, "error": str(e)}]}
 
 
-# =============================================================================
-# NODES 4-6: Platform-specific nodes for multi-agent parallel execution
-# =============================================================================
+# --- Multi-agent platform nodes (generated via factory) ---
 
-async def execute_gmail_node(state: WorkflowState) -> dict:
-    """Execute GmailAgent for multi-agent queries."""
-    from agents.gmail_agent import GmailAgent
-
-    user_id = state.get("user_id", "default")
-    query = state["query"]
-    operations = state.get("operations")
-
-    try:
-        agent = GmailAgent(user_id=user_id)
-        result = await agent.execute(query, operations=operations)
-        return {
-            "agent_results": [{
-                "agent": "GmailAgent",
-                "result": result,
-            }],
-        }
-    except Exception as e:
-        logger.error(f"[GMAIL] Multi-agent execution failed: {e}")
-        return {
-            "agent_results": [{
-                "agent": "GmailAgent",
-                "error": str(e),
-            }],
-        }
+def _make_platform_node(platform, module_path, class_name):
+    """Create a multi-agent execution node for a platform."""
+    async def node(state: WorkflowState) -> dict:
+        from importlib import import_module
+        cls = getattr(import_module(module_path), class_name)
+        user_id = state.get("user_id", "default")
+        parsed_intent = state.get("parsed_intent")
+        try:
+            result = await cls(user_id=user_id).execute(
+                state["query"], operations=state.get("operations"),
+                parsed_intent=parsed_intent,
+            )
+            return {"agent_results": [{"agent": class_name, "result": result}]}
+        except Exception as e:
+            logger.error(f"[{platform}] Multi-agent failed: {e}")
+            return {"agent_results": [{"agent": class_name, "error": str(e)}]}
+    node.__name__ = f"execute_{platform.lower()}_node"
+    return node
 
 
-async def execute_slack_node(state: WorkflowState) -> dict:
-    """Execute SlackAgent for multi-agent queries."""
-    from agents.slack_agent import SlackAgent
+execute_gmail_node = _make_platform_node("GMAIL", "agents.gmail_agent", "GmailAgent")
+execute_slack_node = _make_platform_node("SLACK", "agents.slack_agent", "SlackAgent")
+execute_outlook_node = _make_platform_node("OUTLOOK", "agents.outlook_agent", "OutlookAgent")
 
-    user_id = state.get("user_id", "default")
-    query = state["query"]
-    operations = state.get("operations")
-
-    try:
-        agent = SlackAgent(user_id=user_id)
-        result = await agent.execute(query, operations=operations)
-        return {
-            "agent_results": [{
-                "agent": "SlackAgent",
-                "result": result,
-            }],
-        }
-    except Exception as e:
-        logger.error(f"[SLACK] Multi-agent execution failed: {e}")
-        return {
-            "agent_results": [{
-                "agent": "SlackAgent",
-                "error": str(e),
-            }],
-        }
-
-
-async def execute_outlook_node(state: WorkflowState) -> dict:
-    """Execute OutlookAgent for multi-agent queries."""
-    from agents.outlook_agent import OutlookAgent
-
-    user_id = state.get("user_id", "default")
-    query = state["query"]
-    operations = state.get("operations")
-
-    try:
-        agent = OutlookAgent(user_id=user_id)
-        result = await agent.execute(query, operations=operations)
-        return {
-            "agent_results": [{
-                "agent": "OutlookAgent",
-                "result": result,
-            }],
-        }
-    except Exception as e:
-        logger.error(f"[OUTLOOK] Multi-agent execution failed: {e}")
-        return {
-            "agent_results": [{
-                "agent": "OutlookAgent",
-                "error": str(e),
-            }],
-        }
-
-
-# =============================================================================
-# NODE 7: merge_node
-# =============================================================================
 
 async def merge_node(state: WorkflowState) -> dict:
-    """
-    Pass-through node for multi-agent results.
-
-    operator.add on agent_results already merged the lists from parallel nodes.
-    This node exists as the convergence point after parallel execution.
-    """
+    """Convergence point after parallel multi-agent execution."""
     return {}
 
-
-# =============================================================================
-# NODE 8: handle_general_node
-# =============================================================================
 
 async def handle_general_node(state: WorkflowState) -> dict:
     """Handle GENERAL/CHAT queries using LLM with automatic fallback."""
     query = state["query"]
-    brain_router = get_brain_router()
-
     try:
-        content = brain_router.invoke_with_fallback(
+        content = get_brain_router().invoke_with_fallback(
             f"You are a corporate assistant. Answer this briefly:\n{query}",
             task_type="general",
         )
@@ -309,162 +343,90 @@ async def handle_general_node(state: WorkflowState) -> dict:
         }
     except Exception as e:
         logger.error(f"General handler failed (all LLMs): {e}")
-        return {
-            "agent_results": [{
-                "agent": "Supervisor (direct)",
-                "error": str(e),
-            }],
-        }
+        return {"agent_results": [{"agent": "Supervisor (direct)", "error": str(e)}]}
 
-
-# =============================================================================
-# NODE 9: answer_node
-# =============================================================================
 
 async def answer_node(state: WorkflowState) -> dict:
-    """
-    Builds the final WebSocket response dict from agent_results.
-
-    For single-agent: extracts the one result.
-    For multi-agent: merges all results into a combined response.
-
-    Output format matches what main.py expects for WebSocket send:
-    {
-        "type": "response",
-        "route": "GMAIL",
-        "agent": "GmailAgent",
-        "routed_by": "keyword",
-        "data": { ... agent result ... },
-        "query": "..."
-    }
-    """
+    """Build final WebSocket response from agent_results."""
     agent_results = state.get("agent_results", [])
     route = state.get("route", "GENERAL")
     query = state.get("query", "")
     routed_by = state.get("routed_by", "unknown")
 
     if not agent_results:
-        return {
-            "final_response": {
-                "type": "response",
-                "route": route,
-                "agent": "Supervisor",
-                "routed_by": routed_by,
-                "data": {"error": "No agent produced results"},
-                "query": query,
-            }
-        }
+        return {"final_response": _build_response(
+            route, "Supervisor", routed_by, {"error": "No agent produced results"}, query
+        )}
 
-    # Single-agent or general: use the first (only) result
     if len(agent_results) == 1:
-        ar = agent_results[0]
-        agent_name = ar.get("agent", "Unknown")
-        result_data = ar.get("result", ar.get("error", "No result"))
+        return {"final_response": _build_single_response(agent_results[0], route, routed_by, query)}
 
-        return {
-            "final_response": {
-                "type": "response",
-                "route": route,
-                "agent": agent_name,
-                "routed_by": routed_by,
-                "data": result_data,
-                "query": query,
-            }
-        }
+    return {"final_response": _build_multi_response(agent_results, routed_by, query)}
 
-    # Multi-agent: merge results from all agents
+
+def _build_response(route, agent, routed_by, data, query, **extra):
+    resp = {"type": "response", "route": route, "agent": agent,
+            "routed_by": routed_by, "data": data, "query": query}
+    resp.update(extra)
+    return resp
+
+
+def _build_single_response(entry, route, routed_by, query):
+    return _build_response(
+        route, entry.get("agent", "Unknown"), routed_by,
+        entry.get("result", entry.get("error", "No result")), query,
+    )
+
+
+def _build_multi_response(agent_results, routed_by, query):
     merged_data = {}
     agents_used = []
-    for ar in agent_results:
-        agent_name = ar.get("agent", "Unknown")
-        agents_used.append(agent_name)
-        result = ar.get("result")
-        error = ar.get("error")
-        if result:
-            merged_data[agent_name] = result
-        elif error:
-            merged_data[agent_name] = {"error": error}
+    for entry in agent_results:
+        name = entry.get("agent", "Unknown")
+        agents_used.append(name)
+        merged_data[name] = entry.get("result") or {"error": entry.get("error")}
 
-    # Build combined final answer
-    combined_answers = []
-    for agent_name, result in merged_data.items():
+    combined = []
+    for name, result in merged_data.items():
         if isinstance(result, dict) and "final_answer" in result:
-            combined_answers.append(
-                f"[{agent_name}] {result['final_answer']}"
-            )
+            combined.append(f"[{name}] {result['final_answer']}")
         elif isinstance(result, dict) and "error" in result:
-            combined_answers.append(
-                f"[{agent_name}] Error: {result['error']}"
-            )
+            combined.append(f"[{name}] Error: {result['error']}")
 
-    return {
-        "final_response": {
-            "type": "response",
-            "route": "MULTI",
-            "agent": ", ".join(agents_used),
-            "routed_by": routed_by,
-            "data": merged_data,
-            "combined_answer": "\n\n".join(combined_answers),
-            "query": query,
-        }
-    }
+    return _build_response(
+        "MULTI", ", ".join(agents_used), routed_by, merged_data, query,
+        combined_answer="\n\n".join(combined),
+    )
 
 
-# =============================================================================
-# ROUTE DECISION — conditional edge function
-# =============================================================================
+# --- Routing decision ---
 
 def route_decision(state: WorkflowState):
-    """
-    Conditional edge after route_node.
-
-    Returns:
-      - "single"  for single-agent queries (GMAIL, SLACK, OUTLOOK)
-      - "general" for CHAT/GENERAL queries
-      - list of node names for parallel multi-agent execution
-    """
+    """Conditional edge: returns target node name(s) after routing."""
     route = state.get("route", "GENERAL")
 
-    # Multi-agent: fan out to all target agents in parallel
     if route == "MULTI":
         targets = state.get("target_agents", [])
-        node_map = {
-            "GMAIL": "execute_gmail",
-            "SLACK": "execute_slack",
-            "OUTLOOK": "execute_outlook",
-        }
+        node_map = {"GMAIL": "execute_gmail", "SLACK": "execute_slack", "OUTLOOK": "execute_outlook"}
         nodes = [node_map[t] for t in targets if t in node_map]
         return nodes if nodes else ["handle_general"]
 
-    # Single agent
     if route in AGENT_PLATFORMS:
         return ["execute_single_agent"]
 
-    # General / Chat / Unknown
     return ["handle_general"]
 
 
-# =============================================================================
-# BUILD WORKFLOW — Constructs the compiled StateGraph
-# =============================================================================
+# --- Build and compile the graph ---
 
 def build_workflow():
-    """
-    Build and compile the LangGraph StateGraph.
+    """Build and compile the LangGraph StateGraph.
 
-    Graph structure:
-      START -> classify -> route -> (conditional) -> answer -> END
-
-    The conditional edge after route fans out to:
-      - execute_single_agent (for single-platform queries)
-      - execute_gmail + execute_slack + execute_outlook (parallel multi-agent)
-      - handle_general (for chat/general)
+    Phase 8 flow: understand → [execute_*] → answer
     """
     graph = StateGraph(WorkflowState)
 
-    # --- Add all nodes ---
-    graph.add_node("classify", classify_node)
-    graph.add_node("route", route_node)
+    graph.add_node("understand", understand_node)
     graph.add_node("execute_single_agent", execute_single_agent_node)
     graph.add_node("execute_gmail", execute_gmail_node)
     graph.add_node("execute_slack", execute_slack_node)
@@ -473,47 +435,28 @@ def build_workflow():
     graph.add_node("handle_general", handle_general_node)
     graph.add_node("answer", answer_node)
 
-    # --- Entry point ---
-    graph.set_entry_point("classify")
+    graph.set_entry_point("understand")
 
-    # --- Sequential edges ---
-    graph.add_edge("classify", "route")
+    graph.add_conditional_edges("understand", route_decision, {
+        "execute_single_agent": "execute_single_agent",
+        "execute_gmail": "execute_gmail",
+        "execute_slack": "execute_slack",
+        "execute_outlook": "execute_outlook",
+        "handle_general": "handle_general",
+    })
 
-    # --- Conditional edge: route -> (decision) ---
-    graph.add_conditional_edges(
-        "route",
-        route_decision,
-        {
-            "execute_single_agent": "execute_single_agent",
-            "execute_gmail": "execute_gmail",
-            "execute_slack": "execute_slack",
-            "execute_outlook": "execute_outlook",
-            "handle_general": "handle_general",
-        },
-    )
-
-    # --- After execution, go to answer (or merge first for multi) ---
     graph.add_edge("execute_single_agent", "answer")
     graph.add_edge("handle_general", "answer")
-
-    # Multi-agent nodes converge at merge, then answer
     graph.add_edge("execute_gmail", "merge")
     graph.add_edge("execute_slack", "merge")
     graph.add_edge("execute_outlook", "merge")
     graph.add_edge("merge", "answer")
-
-    # --- Answer -> END ---
     graph.add_edge("answer", END)
 
     return graph.compile()
 
 
-# =============================================================================
-# SINGLETON ACCESSOR
-# =============================================================================
-
 _workflow_instance = None
-
 
 def get_workflow():
     """Get the singleton compiled workflow graph."""

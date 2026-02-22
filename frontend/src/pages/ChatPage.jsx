@@ -1,11 +1,10 @@
 import { useOutletContext } from 'react-router-dom'
 import ChatContainer from '../components/chat/ChatContainer'
-import useWebSocket from '../hooks/useWebSocket'
 import { AlertCircle } from 'lucide-react'
 
 export default function ChatPage() {
-  const { activeCount } = useOutletContext()
-  const { messages, isConnected, isThinking, sendMessage } = useWebSocket('default')
+  const { activeCount, chat } = useOutletContext()
+  const { messages, isConnected, isThinking, sendMessage } = chat
 
   return (
     <div className="h-[calc(100vh-8rem-2rem)]">

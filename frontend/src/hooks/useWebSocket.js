@@ -36,10 +36,21 @@ export default function useWebSocket(userId = 'default') {
             timestamp: new Date(),
           }])
         } else if (data.type === 'response') {
+          // Extract human-readable text from structured response
+          let displayContent = data.combined_answer
+          if (!displayContent) {
+            const raw = data.data
+            if (raw && typeof raw === 'object') {
+              displayContent = raw.final_answer || raw.error || JSON.stringify(raw, null, 2)
+            } else {
+              displayContent = raw
+            }
+          }
+
           setMessages(prev => [...prev, {
             id: Date.now(),
             type: 'assistant',
-            content: data.data,
+            content: displayContent,
             route: data.route,
             agent: data.agent,
             routedBy: data.routed_by,

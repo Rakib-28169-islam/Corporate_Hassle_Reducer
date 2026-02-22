@@ -138,7 +138,7 @@ async def run_tests():
     # Verify it's a proper TypedDict with expected keys
     expected_keys = {
         "user_id", "query", "route", "routed_by", "operations",
-        "pipeline", "is_multi_agent", "target_agents",
+        "pipeline", "parsed_intent", "is_multi_agent", "target_agents",
         "agent_results", "final_response", "error",
     }
     actual_keys = set(WorkflowState.__annotations__.keys())

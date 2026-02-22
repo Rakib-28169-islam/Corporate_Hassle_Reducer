@@ -1,13 +1,4 @@
-"""
-QueryRouter — Extracted routing logic from SupervisorAgent.
-
-Two-layer routing:
-  Layer 1: Keyword match via n-gram hashmap (instant, free)
-  Layer 2: LLM classification via BrainRouter (only if keywords fail)
-
-This is a verbatim extraction — zero behavior change from the original
-supervisor routing code. The supervisor now delegates to this class.
-"""
+"""QueryRouter — two-layer routing: keyword hashmap (instant) + LLM fallback."""
 
 import logging
 
@@ -17,15 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 class QueryRouter:
-    """
-    Routes user queries to the correct platform agent.
+    """Routes user queries to the correct platform agent."""
 
-    Uses the same two-layer approach as the original SupervisorAgent:
-      1. Fast keyword hashmap (O(W) where W = words in query)
-      2. LLM fallback for ambiguous queries
-    """
-
-    # --- Keyword Pre-Router (instant, no API call) ---
     KEYWORD_RULES = {
         "GMAIL": [
             "gmail", "g-mail", "google mail",
@@ -39,7 +23,7 @@ class QueryRouter:
             "search email", "find email", "email from", "email about",
             "attachment", "attached file", "download attachment",
             "newsletter", "unsubscribe", "promotions", "cc", "bcc",
-            "subject line", "mail", "mailing",
+            "subject line", "mail", "mailing", "emails", "email",
         ],
         "SLACK": [
             "slack",
@@ -65,9 +49,18 @@ class QueryRouter:
             "work email", "office email",
             "teams", "teams meeting", "teams call",
         ],
+        "GENERAL": [
+            "hi", "hello", "hey", "howdy", "sup", "yo",
+            "good morning", "good afternoon", "good evening",
+            "thanks", "thank you", "thx",
+            "bye", "goodbye", "see you",
+            "who are you", "what are you", "what can you do",
+            "whats your agenda", "your agenda",
+            "how does this work", "help me",
+            "ok", "okay", "sure",
+        ],
     }
 
-    # Platform identifiers that instantly lock the route (highest priority)
     PLATFORM_NAMES = {
         "GMAIL": ["gmail", "g-mail", "google mail", "GMAIL", "Gmail",
                    "G-mail", "Google Mail"],
@@ -76,7 +69,6 @@ class QueryRouter:
                      "microsoft mail"],
     }
 
-    # --- LLM Router (only for ambiguous queries) ---
     ROUTING_PROMPT = """You are a query router for a corporate assistant.
 Classify the user's query into ONE of these categories:
 
@@ -98,17 +90,15 @@ Category:"""
     def __init__(self):
         self.brain = get_brain_router()
         self._platform_index = self._build_index(self.PLATFORM_NAMES)
-        self._keyword_index = self._build_index(self.KEYWORD_RULES)
+        platform_rules = {k: v for k, v in self.KEYWORD_RULES.items() if k != "GENERAL"}
+        general_rules = {k: v for k, v in self.KEYWORD_RULES.items() if k == "GENERAL"}
+        self._keyword_index = self._build_index(platform_rules)
+        self._general_index = self._build_index(general_rules)
         logger.info("QueryRouter initialized with pre-built keyword indexes.")
 
     @staticmethod
     def _build_index(rules):
-        """
-        Converts keyword lists into hashmaps for O(1) lookup.
-        Single words  -> {word: agent}          (1-gram)
-        Two words     -> {"word1 word2": agent}  (2-gram)
-        Three words   -> {"w1 w2 w3": agent}     (3-gram)
-        """
+        """Converts keyword lists into n-gram hashmaps for O(1) lookup."""
         index = {"1g": {}, "2g": {}, "3g": {}}
         for agent, keywords in rules.items():
             for kw in keywords:
@@ -143,28 +133,53 @@ Category:"""
         return clean.split()
 
     def _keyword_route(self, query):
-        """
-        FAST PATH: Hashmap-based keyword matching.
-        O(W) where W = number of words in query.
+        """Fast keyword-based routing.
+
+        Priority (longest match = most specific intent):
+          1. Platform names (explicit: "gmail", "slack", "outlook")
+          2. Multi-word matches (3g, 2g) from platform AND general
+          3. Platform single-word keywords (1g)
+          4. General single-word keywords (1g)
+
+        This ensures "whats your agenda" (GENERAL 3g) beats "agenda" (OUTLOOK 1g).
         """
         words = self._clean_query(query)
         bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
         trigrams = [f"{words[i]} {words[i+1]} {words[i+2]}"
                     for i in range(len(words)-2)]
 
-        # Priority 1: Explicit platform name
-        result = self._search_index(self._platform_index, words, bigrams,
-                                    trigrams)
+        # Priority 1: Platform names (explicit mentions)
+        result = self._search_index(self._platform_index, words, bigrams, trigrams)
         if result:
             return result
 
-        # Priority 2: General keywords
-        result = self._search_index(self._keyword_index, words, bigrams,
-                                    trigrams)
-        return result
+        # Priority 2: Multi-word phrases (3g then 2g) — check BOTH indexes
+        for tg in trigrams:
+            if tg in self._keyword_index["3g"]:
+                return self._keyword_index["3g"][tg]
+            if tg in self._general_index["3g"]:
+                return self._general_index["3g"][tg]
+
+        for bg in bigrams:
+            if bg in self._keyword_index["2g"]:
+                return self._keyword_index["2g"][bg]
+            if bg in self._general_index["2g"]:
+                return self._general_index["2g"][bg]
+
+        # Priority 3: Platform single keywords (1g)
+        for w in words:
+            if w in self._keyword_index["1g"]:
+                return self._keyword_index["1g"][w]
+
+        # Priority 4: General single keywords (1g)
+        for w in words:
+            if w in self._general_index["1g"]:
+                return self._general_index["1g"][w]
+
+        return None
 
     def _llm_route(self, query):
-        """SLOW PATH: Use AI to classify ambiguous queries (~300-500ms)."""
+        """LLM fallback for ambiguous queries."""
         try:
             content = self.brain.invoke_with_fallback(
                 self.ROUTING_PROMPT.format(query=query),
@@ -182,14 +197,7 @@ Category:"""
             return "GENERAL"
 
     def route_query(self, query):
-        """
-        Smart 2-layer routing:
-          Layer 1: Keyword match (instant, free)
-          Layer 2: LLM classification (only if keywords fail)
-
-        Returns:
-            tuple: (route, routed_by) e.g. ("GMAIL", "keyword")
-        """
+        """Two-layer routing: keyword match first, then LLM fallback. Returns (route, routed_by)."""
         route = self._keyword_route(query)
         if route:
             return route, "keyword"
@@ -197,10 +205,6 @@ Category:"""
         route = self._llm_route(query)
         return route, "llm"
 
-
-# =============================================================================
-# SINGLETON ACCESSOR
-# =============================================================================
 
 _router_instance = None
 
@@ -211,33 +215,3 @@ def get_router():
     if _router_instance is None:
         _router_instance = QueryRouter()
     return _router_instance
-
-
-# =============================================================================
-# TEST BLOCK
-# =============================================================================
-if __name__ == "__main__":
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    print("Testing QueryRouter...")
-    print("=" * 60)
-    router = QueryRouter()
-
-    test_queries = [
-        "Check my unread emails",
-        "Send a Slack message to #general",
-        "What meetings do I have today?",
-        "Hello, how are you?",
-        "Draft an email to boss@company.com",
-        "Search Slack for project updates",
-        "Create a calendar event for tomorrow",
-        "Check is there any emails from Alice in gmail?",
-    ]
-
-    print("\nRouting Tests:")
-    print("-" * 60)
-    for q in test_queries:
-        route, method = router.route_query(q)
-        print(f"  [{route:8s}] ({method:7s}) {q}")

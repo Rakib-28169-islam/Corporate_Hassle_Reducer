@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom'
-import { Activity } from 'lucide-react'
+import { Activity, LogOut, User } from 'lucide-react'
 
 const pageTitles = {
   '/': 'Dashboard',
@@ -7,7 +7,7 @@ const pageTitles = {
   '/chat': 'Chat with AI',
 }
 
-export default function TopBar({ activeCount = 0 }) {
+export default function TopBar({ activeCount = 0, userEmail, onLogout }) {
   const { pathname } = useLocation()
   const title = pageTitles[pathname] || 'Dashboard'
 
@@ -22,6 +22,25 @@ export default function TopBar({ activeCount = 0 }) {
             {activeCount} tool{activeCount !== 1 ? 's' : ''} connected
           </span>
         </div>
+
+        {userEmail && (
+          <>
+            <div className="h-4 w-px bg-slate-600" />
+            <div className="flex items-center gap-2 text-sm text-slate-300">
+              <User size={14} className="text-slate-400" />
+              <span className="max-w-[200px] truncate">{userEmail}</span>
+            </div>
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-red-400 transition-colors"
+                title="Sign out"
+              >
+                <LogOut size={14} />
+              </button>
+            )}
+          </>
+        )}
       </div>
     </header>
   )

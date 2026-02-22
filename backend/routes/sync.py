@@ -1,21 +1,10 @@
-"""
-=============================================================================
-SYNC ROUTES — Data Sync Endpoints
-=============================================================================
-
-Endpoints for triggering data sync after OAuth and checking sync status.
-
-    POST /api/sync/on-connected  → Trigger initial fetch after OAuth completes
-    GET  /api/sync/status/{uid}  → Check sync status per tool
-    POST /api/sync/refresh/{tool}→ Force re-fetch all data for a tool
-
-=============================================================================
-"""
+"""Sync routes — data sync endpoints after OAuth and periodic refresh."""
 
 import logging
 from fastapi import APIRouter, HTTPException, Query
 
 from database import get_database
+from database.vector_store import get_vector_store
 from services.data_fetch_service import get_data_fetch_service
 
 logger = logging.getLogger(__name__)
@@ -29,68 +18,41 @@ async def on_tool_connected(
     user_id: str = Query("default", description="User ID"),
     connection_id: str = Query(None, description="Composio connection ID"),
 ):
-    """
-    Called by frontend after OAuth completes successfully.
-
-    Flow:
-        1. Create user in local DB if new
-        2. Save/update connection status to 'connected'
-        3. Run initial_fetch (blocking ~3-5s) — fetches recent data
-        4. Return count of items synced
-
-    The frontend should call this AFTER polling /api/auth/status/{id}
-    returns status=ACTIVE.
-    """
+    """Called by frontend after OAuth completes. Creates user, saves connection, fetches data."""
     tool_name = tool_name.lower()
     if tool_name not in ("gmail", "slack", "outlook"):
         raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
 
     db = get_database()
 
-    # 1. Create user if new (idempotent — returns False if exists)
     await db.create_user(user_id, name=user_id)
 
-    # 2. Save connection as 'connected'
     conn_id = connection_id or f"{user_id}_{tool_name}"
     await db.save_connection(
-        connection_id=conn_id,
-        user_id=user_id,
-        tool=tool_name,
-        composio_id=connection_id,
-        status="connected",
+        connection_id=conn_id, user_id=user_id, tool=tool_name,
+        composio_id=connection_id, status="connected",
     )
 
-    # 3. Run initial fetch (blocking — frontend shows spinner)
     fetch = get_data_fetch_service()
     result = await fetch.initial_fetch(user_id, tool_name)
 
-    logger.info(f"[Sync] on-connected: {user_id}/{tool_name} "
-                f"→ {result['count']} items")
+    logger.info(f"[Sync] on-connected: {user_id}/{tool_name} -> {result['count']} items")
 
     return {
-        "status": result["status"],
-        "tool": tool_name,
-        "count": result["count"],
-        "user_id": user_id,
+        "status": result["status"], "tool": tool_name,
+        "count": result["count"], "user_id": user_id,
         "error": result.get("error"),
     }
 
 
 @router.get("/status/{user_id}")
 async def get_sync_status(user_id: str):
-    """
-    Get sync status for a user — how much data is cached per tool.
-
-    Returns:
-        dict with per-tool info: connected, cached_count
-    """
+    """Get sync status for a user — cached data count per tool."""
     db = get_database()
 
-    # Get connections
     connections = await db.get_connections(user_id)
     conn_map = {c["tool"]: c for c in connections}
 
-    # Get cached counts per tool
     status = {}
     for tool in ("gmail", "slack", "outlook"):
         conn = conn_map.get(tool)
@@ -110,29 +72,51 @@ async def force_refresh(
     tool_name: str,
     user_id: str = Query("default", description="User ID"),
 ):
-    """
-    Force re-fetch all data for a tool.
-
-    1. Invalidate existing cache (SQLite + ChromaDB)
-    2. Re-fetch from Composio API
-    3. Return new count
-    """
+    """Force re-fetch: invalidate cache then re-fetch from Composio API."""
     tool_name = tool_name.lower()
     if tool_name not in ("gmail", "slack", "outlook"):
         raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
 
-    # 1. Invalidate existing cache
     from services.sync_service import get_sync_service
     sync = get_sync_service()
     await sync.force_refresh(user_id, tool_name)
 
-    # 2. Re-fetch
     fetch = get_data_fetch_service()
     result = await fetch.initial_fetch(user_id, tool_name)
 
     return {
-        "status": result["status"],
-        "tool": tool_name,
-        "count": result["count"],
-        "user_id": user_id,
+        "status": result["status"], "tool": tool_name,
+        "count": result["count"], "user_id": user_id,
     }
+
+
+@router.delete("/user/{user_id}")
+async def delete_user_data(user_id: str):
+    """Delete ALL data for a user — memory, connections, chat history, user record."""
+    db = get_database()
+
+    deleted = {}
+    for table, col in [
+        ("memory", "user_id"),
+        ("connections", "user_id"),
+        ("chat_history", "user_id"),
+        ("users", "id"),
+    ]:
+        try:
+            count = await db.delete_by_user(table, col, user_id)
+            deleted[table] = count
+        except Exception as e:
+            logger.error(f"[Sync] Failed to delete {table} for {user_id}: {e}")
+            deleted[table] = f"error: {e}"
+
+    # Also clear vector store for this user
+    try:
+        vs = get_vector_store()
+        vs_count = vs.delete_by_user(user_id)
+        deleted["vector_store"] = vs_count
+    except Exception as e:
+        logger.error(f"[Sync] Failed to clear vector store for {user_id}: {e}")
+        deleted["vector_store"] = f"error: {e}"
+
+    logger.info(f"[Sync] Deleted all data for user {user_id}: {deleted}")
+    return {"user_id": user_id, "deleted": deleted}

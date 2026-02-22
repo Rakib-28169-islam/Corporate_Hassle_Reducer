@@ -6,6 +6,7 @@ import ConnectionStatus from './ConnectionStatus'
 import usePolling from '../../hooks/usePolling'
 import { syncOnConnected } from '../../api/sync'
 import { TOOLS } from '../../utils/constants'
+import { getUserId } from '../../utils/userId'
 
 const iconMap = { Mail, Hash, Calendar }
 
@@ -115,7 +116,7 @@ export default function ToolConnectCard({ toolName, connection, onConnect, onDis
       setSyncing(true)
       setSyncResult(null)
       try {
-        const result = await syncOnConnected(toolName, 'default', data.id)
+        const result = await syncOnConnected(toolName, getUserId(), data.id)
         setSyncResult(result)
       } catch (err) {
         setSyncResult({ status: 'error', count: 0, error: err.message })

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { getAllStatus, connectTool, disconnectTool } from '../api/auth'
+import { getUserId } from '../utils/userId'
 
 export default function useAuth() {
   const [connections, setConnections] = useState({
@@ -11,8 +12,13 @@ export default function useAuth() {
   const [error, setError] = useState(null)
 
   const fetchStatus = useCallback(async () => {
+    const uid = getUserId()
+    if (!uid) {
+      setLoading(false)
+      return
+    }
     try {
-      const data = await getAllStatus()
+      const data = await getAllStatus(uid)
       setConnections(data)
       setError(null)
     } catch (err) {
@@ -28,7 +34,7 @@ export default function useAuth() {
 
   const connect = useCallback(async (toolName) => {
     try {
-      const data = await connectTool(toolName)
+      const data = await connectTool(toolName, getUserId())
       // Update local state with initiated connection
       setConnections(prev => ({
         ...prev,
